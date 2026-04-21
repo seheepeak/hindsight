@@ -42,6 +42,11 @@ import type {
     BankConfigResponse,
     CreateBankRequest,
     Budget,
+    BankTemplateManifest,
+    BankTemplateConfig,
+    BankTemplateMentalModel,
+    BankTemplateDirective,
+    BankTemplateImportResponse,
 } from '../generated/types.gen';
 
 export const CLIENT_VERSION = '0.5.1';
@@ -357,7 +362,13 @@ export class HindsightClient {
      */
     async listMemories(
         bankId: string,
-        options?: { limit?: number; offset?: number; type?: string; q?: string }
+        options?: {
+            limit?: number;
+            offset?: number;
+            type?: string;
+            q?: string;
+            consolidationState?: 'failed' | 'pending' | 'done';
+        }
     ): Promise<ListMemoryUnitsResponse> {
         const response = await sdk.listMemories({
             client: this.client,
@@ -367,6 +378,7 @@ export class HindsightClient {
                 offset: options?.offset,
                 type: options?.type,
                 q: options?.q,
+                consolidation_state: options?.consolidationState,
             },
         });
 
@@ -762,6 +774,61 @@ export class HindsightClient {
 
         return this.validateResponse(response, 'getMentalModelHistory');
     }
+
+    /**
+     * Get a document by ID. Returns null if not found.
+     */
+    async getDocument(bankId: string, documentId: string): Promise<any | null> {
+        const response = await sdk.getDocument({
+            client: this.client,
+            path: { bank_id: bankId, document_id: documentId },
+        });
+
+        if ((response as any).response?.status === 404) {
+            return null;
+        }
+
+        return this.validateResponse(response, 'getDocument');
+    }
+
+    /**
+     * List documents in a bank.
+     */
+    async listDocuments(bankId: string, options?: { limit?: number; offset?: number }): Promise<any> {
+        const response = await sdk.listDocuments({
+            client: this.client,
+            path: { bank_id: bankId },
+            query: { limit: options?.limit, offset: options?.offset },
+        });
+
+        return this.validateResponse(response, 'listDocuments');
+    }
+
+    /**
+     * Delete a document.
+     */
+    async deleteDocument(bankId: string, documentId: string): Promise<void> {
+        const response = await sdk.deleteDocument({
+            client: this.client,
+            path: { bank_id: bankId, document_id: documentId },
+        });
+        if (response.error) {
+            throw new Error(`deleteDocument failed: ${JSON.stringify(response.error)}`);
+        }
+    }
+
+    /**
+     * Update a document's mutable fields.
+     */
+    async updateDocument(bankId: string, documentId: string, options: { tags?: string[] }): Promise<any> {
+        const response = await sdk.updateDocument({
+            client: this.client,
+            path: { bank_id: bankId, document_id: documentId },
+            body: { tags: options.tags },
+        });
+
+        return this.validateResponse(response, 'updateDocument');
+    }
 }
 
 /**
@@ -824,6 +891,11 @@ export type {
     BankConfigResponse,
     CreateBankRequest,
     Budget,
+    BankTemplateManifest,
+    BankTemplateConfig,
+    BankTemplateMentalModel,
+    BankTemplateDirective,
+    BankTemplateImportResponse,
 };
 
 // Also export low-level SDK functions for advanced usage

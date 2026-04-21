@@ -7,7 +7,7 @@ info:
     name: Apache 2.0
     url: https://www.apache.org/licenses/LICENSE-2.0.html
   title: Hindsight HTTP API
-  version: 0.5.1
+  version: 0.5.3
 servers:
 - url: /
 paths:
@@ -161,6 +161,14 @@ paths:
       - explode: true
         in: query
         name: q
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      - explode: true
+        in: query
+        name: consolidation_state
         required: false
         schema:
           nullable: true
@@ -569,6 +577,66 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
       summary: List entities
+      tags:
+      - Entities
+  /v1/default/banks/{bank_id}/entities/graph:
+    get:
+      description: Return a graph of entities (nodes) and their co-occurrences (edges)
+        for visualization.
+      operationId: get_entity_graph
+      parameters:
+      - explode: false
+        in: path
+        name: bank_id
+        required: true
+        schema:
+          title: Bank Id
+          type: string
+        style: simple
+      - description: Maximum number of co-occurrence edges to return
+        explode: true
+        in: query
+        name: limit
+        required: false
+        schema:
+          default: 1000
+          description: Maximum number of co-occurrence edges to return
+          title: Limit
+          type: integer
+        style: form
+      - description: Minimum cooccurrence_count to include an edge
+        explode: true
+        in: query
+        name: min_count
+        required: false
+        schema:
+          default: 1
+          description: Minimum cooccurrence_count to include an edge
+          title: Min Count
+          type: integer
+        style: form
+      - explode: false
+        in: header
+        name: authorization
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EntityGraphResponse'
+          description: Successful Response
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+          description: Validation Error
+      summary: Get entity co-occurrence graph
       tags:
       - Entities
   /v1/default/banks/{bank_id}/entities/{entity_id}:
@@ -3499,6 +3567,7 @@ components:
       description: Response model for bank statistics endpoint.
       example:
         bank_id: user123
+        failed_consolidation: 0
         failed_operations: 0
         last_consolidated_at: 2024-01-15T10:30:00Z
         links_breakdown:
@@ -3573,6 +3642,12 @@ components:
           default: 0
           description: Number of memories not yet processed into observations
           title: Pending Consolidation
+          type: integer
+        failed_consolidation:
+          default: 0
+          description: Number of source memories (world/experience) whose consolidation
+            permanently failed and can be retried via the consolidation recovery endpoint.
+          title: Failed Consolidation
           type: integer
         total_observations:
           default: 0
@@ -3675,6 +3750,33 @@ components:
           items: {}
           nullable: true
           type: array
+        recall_budget_function:
+          nullable: true
+          type: string
+        recall_budget_fixed_low:
+          nullable: true
+          type: integer
+        recall_budget_fixed_mid:
+          nullable: true
+          type: integer
+        recall_budget_fixed_high:
+          nullable: true
+          type: integer
+        recall_budget_adaptive_low:
+          nullable: true
+          type: number
+        recall_budget_adaptive_mid:
+          nullable: true
+          type: number
+        recall_budget_adaptive_high:
+          nullable: true
+          type: number
+        recall_budget_min:
+          nullable: true
+          type: integer
+        recall_budget_max:
+          nullable: true
+          type: integer
       title: BankTemplateConfig
     BankTemplateDirective:
       description: |-
@@ -4480,6 +4582,58 @@ components:
       - mention_count
       - observations
       title: EntityDetailResponse
+    EntityGraphResponse:
+      description: Response model for entity co-occurrence graph endpoint.
+      example:
+        edges:
+        - data:
+            color: '#ffd700'
+            id: uuid-1-uuid-2
+            lastCooccurred: 2024-02-01T14:00:00Z
+            lineStyle: solid
+            linkType: cooccurrence
+            source: uuid-1
+            target: uuid-2
+            weight: 5
+        limit: 1000
+        nodes:
+        - data:
+            color: '#42a5f5'
+            id: uuid-1
+            label: Alice
+            mentionCount: 12
+        - data:
+            color: '#42a5f5'
+            id: uuid-2
+            label: Google
+            mentionCount: 8
+        total_edges: 1
+        total_entities: 2
+      properties:
+        nodes:
+          items:
+            additionalProperties: {}
+          type: array
+        edges:
+          items:
+            additionalProperties: {}
+          type: array
+        total_entities:
+          title: Total Entities
+          type: integer
+        total_edges:
+          title: Total Edges
+          type: integer
+        limit:
+          title: Limit
+          type: integer
+      required:
+      - edges
+      - limit
+      - nodes
+      - total_edges
+      - total_entities
+      title: EntityGraphResponse
     EntityIncludeOptions:
       description: Options for including entity observations in recall results.
       properties:
@@ -4973,6 +5127,7 @@ components:
           created_at: created_at
           id: id
           trigger:
+            mode: full
             refresh_after_consolidation: false
             recall_chunks_max_tokens: 1
             tag_groups:
@@ -4995,6 +5150,7 @@ components:
             exclude_mental_models: false
             recall_max_tokens: 6
           last_refreshed_at: last_refreshed_at
+          is_stale: true
           content: content
           tags:
           - tags
@@ -5008,6 +5164,7 @@ components:
           created_at: created_at
           id: id
           trigger:
+            mode: full
             refresh_after_consolidation: false
             recall_chunks_max_tokens: 1
             tag_groups:
@@ -5030,6 +5187,7 @@ components:
             exclude_mental_models: false
             recall_max_tokens: 6
           last_refreshed_at: last_refreshed_at
+          is_stale: true
           content: content
           tags:
           - tags
@@ -5054,6 +5212,7 @@ components:
         created_at: created_at
         id: id
         trigger:
+          mode: full
           refresh_after_consolidation: false
           recall_chunks_max_tokens: 1
           tag_groups:
@@ -5076,6 +5235,7 @@ components:
           exclude_mental_models: false
           recall_max_tokens: 6
         last_refreshed_at: last_refreshed_at
+        is_stale: true
         content: content
         tags:
         - tags
@@ -5115,6 +5275,9 @@ components:
         reflect_response:
           additionalProperties: {}
           nullable: true
+        is_stale:
+          nullable: true
+          type: boolean
       required:
       - bank_id
       - id
@@ -5123,6 +5286,19 @@ components:
     MentalModelTrigger-Input:
       description: Trigger settings for a mental model.
       properties:
+        mode:
+          default: full
+          description: "Refresh mode. 'full' (default) regenerates the mental model\
+            \ content from scratch on each refresh. 'delta' performs surgical edits\
+            \ against the existing content: unchanged sections are preserved byte-for-byte,\
+            \ stale content is removed, new content is added. If the mental model\
+            \ has no existing content, or if the source_query has changed since the\
+            \ last refresh, delta mode falls back to a full regeneration automatically."
+          enum:
+          - full
+          - delta
+          title: Mode
+          type: string
         refresh_after_consolidation:
           default: false
           description: "If true, refresh this mental model after observations consolidation\
@@ -5175,6 +5351,7 @@ components:
     MentalModelTrigger-Output:
       description: Trigger settings for a mental model.
       example:
+        mode: full
         refresh_after_consolidation: false
         recall_chunks_max_tokens: 1
         tag_groups:
@@ -5197,6 +5374,19 @@ components:
         exclude_mental_models: false
         recall_max_tokens: 6
       properties:
+        mode:
+          default: full
+          description: "Refresh mode. 'full' (default) regenerates the mental model\
+            \ content from scratch on each refresh. 'delta' performs surgical edits\
+            \ against the existing content: unchanged sections are preserved byte-for-byte,\
+            \ stale content is removed, new content is added. If the mental model\
+            \ has no existing content, or if the source_query has changed since the\
+            \ last refresh, delta mode falls back to a full regeneration automatically."
+          enum:
+          - full
+          - delta
+          title: Mode
+          type: string
         refresh_after_consolidation:
           default: false
           description: "If true, refresh this mental model after observations consolidation\

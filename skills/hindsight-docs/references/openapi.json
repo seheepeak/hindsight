@@ -10,7 +10,7 @@
       "name": "Apache 2.0",
       "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
     },
-    "version": "0.5.1"
+    "version": "0.5.3"
   },
   "paths": {
     "/health": {
@@ -253,6 +253,22 @@
                 }
               ],
               "title": "Q"
+            }
+          },
+          {
+            "name": "consolidation_state",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Consolidation State"
             }
           },
           {
@@ -830,6 +846,89 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/EntityListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/default/banks/{bank_id}/entities/graph": {
+      "get": {
+        "tags": [
+          "Entities"
+        ],
+        "summary": "Get entity co-occurrence graph",
+        "description": "Return a graph of entities (nodes) and their co-occurrences (edges) for visualization.",
+        "operationId": "get_entity_graph",
+        "parameters": [
+          {
+            "name": "bank_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Bank Id"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "description": "Maximum number of co-occurrence edges to return",
+              "default": 1000,
+              "title": "Limit"
+            },
+            "description": "Maximum number of co-occurrence edges to return"
+          },
+          {
+            "name": "min_count",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "description": "Minimum cooccurrence_count to include an edge",
+              "default": 1,
+              "title": "Min Count"
+            },
+            "description": "Minimum cooccurrence_count to include an edge"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EntityGraphResponse"
                 }
               }
             }
@@ -5176,6 +5275,12 @@
             "description": "Number of memories not yet processed into observations",
             "default": 0
           },
+          "failed_consolidation": {
+            "type": "integer",
+            "title": "Failed Consolidation",
+            "description": "Number of source memories (world/experience) whose consolidation permanently failed and can be retried via the consolidation recovery endpoint.",
+            "default": 0
+          },
           "total_observations": {
             "type": "integer",
             "title": "Total Observations",
@@ -5200,6 +5305,7 @@
         "description": "Response model for bank statistics endpoint.",
         "example": {
           "bank_id": "user123",
+          "failed_consolidation": 0,
           "failed_operations": 0,
           "last_consolidated_at": "2024-01-15T10:30:00Z",
           "links_breakdown": {
@@ -5512,6 +5618,114 @@
             ],
             "title": "Llm Gemini Safety Settings",
             "description": "Per-bank Gemini/VertexAI safety filter settings"
+          },
+          "recall_budget_function": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recall Budget Function",
+            "description": "Recall budget mapping function: 'fixed' or 'adaptive'"
+          },
+          "recall_budget_fixed_low": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recall Budget Fixed Low",
+            "description": "Fixed thinking_budget for budget=low (function='fixed')"
+          },
+          "recall_budget_fixed_mid": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recall Budget Fixed Mid",
+            "description": "Fixed thinking_budget for budget=mid (function='fixed')"
+          },
+          "recall_budget_fixed_high": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recall Budget Fixed High",
+            "description": "Fixed thinking_budget for budget=high (function='fixed')"
+          },
+          "recall_budget_adaptive_low": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recall Budget Adaptive Low",
+            "description": "Ratio of max_tokens for budget=low (function='adaptive')"
+          },
+          "recall_budget_adaptive_mid": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recall Budget Adaptive Mid",
+            "description": "Ratio of max_tokens for budget=mid (function='adaptive')"
+          },
+          "recall_budget_adaptive_high": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recall Budget Adaptive High",
+            "description": "Ratio of max_tokens for budget=high (function='adaptive')"
+          },
+          "recall_budget_min": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recall Budget Min",
+            "description": "Floor for the adaptive function (after clamping)"
+          },
+          "recall_budget_max": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recall Budget Max",
+            "description": "Ceiling for the adaptive function (after clamping)"
           }
         },
         "type": "object",
@@ -6760,6 +6974,85 @@
           ]
         }
       },
+      "EntityGraphResponse": {
+        "properties": {
+          "nodes": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Nodes"
+          },
+          "edges": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Edges"
+          },
+          "total_entities": {
+            "type": "integer",
+            "title": "Total Entities"
+          },
+          "total_edges": {
+            "type": "integer",
+            "title": "Total Edges"
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Limit"
+          }
+        },
+        "type": "object",
+        "required": [
+          "nodes",
+          "edges",
+          "total_entities",
+          "total_edges",
+          "limit"
+        ],
+        "title": "EntityGraphResponse",
+        "description": "Response model for entity co-occurrence graph endpoint.",
+        "example": {
+          "edges": [
+            {
+              "data": {
+                "color": "#ffd700",
+                "id": "uuid-1-uuid-2",
+                "lastCooccurred": "2024-02-01T14:00:00Z",
+                "lineStyle": "solid",
+                "linkType": "cooccurrence",
+                "source": "uuid-1",
+                "target": "uuid-2",
+                "weight": 5
+              }
+            }
+          ],
+          "limit": 1000,
+          "nodes": [
+            {
+              "data": {
+                "color": "#42a5f5",
+                "id": "uuid-1",
+                "label": "Alice",
+                "mentionCount": 12
+              }
+            },
+            {
+              "data": {
+                "color": "#42a5f5",
+                "id": "uuid-2",
+                "label": "Google",
+                "mentionCount": 8
+              }
+            }
+          ],
+          "total_edges": 1,
+          "total_entities": 2
+        }
+      },
       "EntityIncludeOptions": {
         "properties": {
           "max_tokens": {
@@ -7678,6 +7971,18 @@
             ],
             "title": "Reflect Response",
             "description": "Full reflect API response payload including based_on facts and observations"
+          },
+          "is_stale": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Stale",
+            "description": "True when new memories matching this mental model's tag/fact_type scope have been ingested since last_refreshed_at, or consolidation has pending items. Only populated when detail=full."
           }
         },
         "type": "object",
@@ -7691,6 +7996,16 @@
       },
       "MentalModelTrigger-Input": {
         "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "full",
+              "delta"
+            ],
+            "title": "Mode",
+            "description": "Refresh mode. 'full' (default) regenerates the mental model content from scratch on each refresh. 'delta' performs surgical edits against the existing content: unchanged sections are preserved byte-for-byte, stale content is removed, new content is added. If the mental model has no existing content, or if the source_query has changed since the last refresh, delta mode falls back to a full regeneration automatically.",
+            "default": "full"
+          },
           "refresh_after_consolidation": {
             "type": "boolean",
             "title": "Refresh After Consolidation",
@@ -7827,6 +8142,16 @@
       },
       "MentalModelTrigger-Output": {
         "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "full",
+              "delta"
+            ],
+            "title": "Mode",
+            "description": "Refresh mode. 'full' (default) regenerates the mental model content from scratch on each refresh. 'delta' performs surgical edits against the existing content: unchanged sections are preserved byte-for-byte, stale content is removed, new content is added. If the mental model has no existing content, or if the source_query has changed since the last refresh, delta mode falls back to a full regeneration automatically.",
+            "default": "full"
+          },
           "refresh_after_consolidation": {
             "type": "boolean",
             "title": "Refresh After Consolidation",

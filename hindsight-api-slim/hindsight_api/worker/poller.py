@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from .exceptions import RetryTaskAt
+from .exceptions import DeferOperation, RetryTaskAt
 from .stage import StageHolder, bind_holder
 
 if TYPE_CHECKING:
@@ -130,6 +130,9 @@ class WorkerPoller:
         self._active_tasks: dict[str, ActiveTaskInfo] = {}
         # Track in-flight tasks by operation type
         self._in_flight_by_type: dict[str, int] = {}
+        # Rotation offset for per-tenant fair claiming. Advances past the last
+        # schema we serviced so a busy tenant can't monopolize the poll order.
+        self._next_schema_idx: int = 0
 
     async def _get_schemas(self) -> list[str | None]:
         """Get list of schemas to poll. Returns [None] for default schema (no prefix)."""
@@ -138,6 +141,60 @@ class WorkerPoller:
         tenants = await self._tenant_extension.list_tenants()
         # Convert default schema to None for SQL compatibility (no prefix), keep others as-is
         return [t.schema if t.schema != DEFAULT_DATABASE_SCHEMA else None for t in tenants]
+
+    async def _scan_active_schemas(self, schemas: list[str | None]) -> set[str | None]:
+        """Find which schemas have pending work.
+
+        Tries a server-side PL/pgSQL function first (single DB round-trip,
+        ~200ms for 1400+ schemas). Falls back to per-schema Python EXISTS
+        queries if the function is not installed (~4ms each).
+
+        The server-side function should be installed in the ``public``
+        schema as::
+
+            CREATE OR REPLACE FUNCTION public.schemas_with_pending_work()
+            RETURNS SETOF text AS $$
+            DECLARE
+              r RECORD; has_work BOOLEAN;
+            BEGIN
+              FOR r IN SELECT nspname FROM pg_namespace
+                       WHERE nspname LIKE 'tenant_%' LOOP
+                BEGIN
+                  EXECUTE format(
+                    'SELECT EXISTS(SELECT 1 FROM %I.async_operations '
+                    'WHERE status = ''pending'' '
+                    'AND task_payload IS NOT NULL LIMIT 1)',
+                    r.nspname) INTO has_work;
+                  IF has_work THEN RETURN NEXT r.nspname; END IF;
+                EXCEPTION WHEN OTHERS THEN NULL;
+                END;
+              END LOOP;
+            END $$ LANGUAGE plpgsql STABLE;
+
+        In hindsight-cloud deployments this is installed by a Helm hook
+        job alongside ``total_pending_tasks()``.
+        """
+        async with self._pool.acquire() as conn:
+            try:
+                rows = await conn.fetch("SELECT * FROM schemas_with_pending_work()")
+                return {r[0] for r in rows}
+            except Exception:
+                pass
+
+            # Fallback: per-schema EXISTS checks from Python
+            active: set[str | None] = set()
+            for schema in schemas:
+                table = fq_table("async_operations", schema)
+                try:
+                    has_work = await conn.fetchval(
+                        f"SELECT EXISTS(SELECT 1 FROM {table} "
+                        f"WHERE status = 'pending' AND task_payload IS NOT NULL LIMIT 1)"
+                    )
+                    if has_work:
+                        active.add(schema)
+                except Exception:
+                    pass
+            return active
 
     async def _get_available_slots(self) -> tuple[int, int]:
         """
@@ -196,6 +253,15 @@ class WorkerPoller:
 
         Uses FOR UPDATE SKIP LOCKED to ensure no conflicts with other workers.
 
+        Schema iteration is round-robin to prevent one busy tenant from
+        starving others. Each poll starts at ``self._next_schema_idx`` and
+        wraps around the full list. First pass caps at 1 claim per schema
+        so every tenant with pending work gets a fair chance; a second
+        pass backfills remaining slots from any schema when there's spare
+        capacity. After the call, the offset advances past the last
+        schema we serviced (or by 1 if nothing was claimed) so the next
+        poll starts at a different position.
+
         Returns:
             List of ClaimedTask objects containing operation_id, task_dict, and schema
         """
@@ -206,15 +272,42 @@ class WorkerPoller:
             return []
 
         schemas = await self._get_schemas()
+        if not schemas:
+            return []
+
+        # Scan: find which schemas have pending work using a lightweight
+        # EXISTS check (no locks). Then only claim from those schemas
+        # using the expensive FOR UPDATE SKIP LOCKED query.
+        active_schemas = await self._scan_active_schemas(schemas)
+
+        if not active_schemas:
+            self._next_schema_idx = (self._next_schema_idx + 1) % len(schemas)
+            return []
+
+        # Build rotation list from active schemas only, preserving their
+        # original positions for correct offset advancement.
+        all_indexed = list(enumerate(schemas))
+        active_indexed = [(i, s) for i, s in all_indexed if s in active_schemas]
+
+        # Rotate so no tenant is always first.
+        start = self._next_schema_idx % len(schemas)
+        rotated = [x for x in active_indexed if x[0] >= start] + [x for x in active_indexed if x[0] < start]
+
         all_tasks: list[ClaimedTask] = []
         remaining_non_consolidation = non_consolidation_available
         remaining_consolidation = consolidation_available
+        last_serviced_idx: int | None = None
+        schemas_with_work: list[tuple[int, str | None]] = []
 
-        for schema in schemas:
+        # Pass 1: fairness pass — iterate only active schemas, cap at
+        # 1 claim per pool per schema.
+        for orig_idx, schema in rotated:
             if remaining_non_consolidation <= 0 and remaining_consolidation <= 0:
                 break
 
-            tasks = await self._claim_batch_for_schema(schema, remaining_non_consolidation, remaining_consolidation)
+            nc_limit = min(1, remaining_non_consolidation)
+            c_limit = min(1, remaining_consolidation)
+            tasks = await self._claim_batch_for_schema(schema, nc_limit, c_limit)
 
             for task in tasks:
                 op_type = task.task_dict.get("operation_type", "unknown")
@@ -223,7 +316,39 @@ class WorkerPoller:
                 else:
                     remaining_non_consolidation -= 1
 
+            if tasks:
+                last_serviced_idx = orig_idx
+                schemas_with_work.append((orig_idx, schema))
+
             all_tasks.extend(tasks)
+
+        # Pass 2: capacity pass — fill remaining slots from schemas
+        # that had work in pass 1 only.
+        if (remaining_non_consolidation > 0 or remaining_consolidation > 0) and schemas_with_work:
+            for orig_idx, schema in schemas_with_work:
+                if remaining_non_consolidation <= 0 and remaining_consolidation <= 0:
+                    break
+
+                tasks = await self._claim_batch_for_schema(schema, remaining_non_consolidation, remaining_consolidation)
+
+                for task in tasks:
+                    op_type = task.task_dict.get("operation_type", "unknown")
+                    if op_type == "consolidation":
+                        remaining_consolidation -= 1
+                    else:
+                        remaining_non_consolidation -= 1
+
+                if tasks:
+                    last_serviced_idx = orig_idx
+
+                all_tasks.extend(tasks)
+
+        # Advance offset past the last schema we serviced, or by 1 if
+        # nothing was claimed (so we don't keep re-hitting an empty head).
+        if last_serviced_idx is not None:
+            self._next_schema_idx = (last_serviced_idx + 1) % len(schemas)
+        else:
+            self._next_schema_idx = (start + 1) % len(schemas)
 
         return all_tasks
 
@@ -461,6 +586,25 @@ class WorkerPoller:
         )
         logger.warning(f"Task {operation_id} scheduled for retry at {retry_at}: {error_message}")
 
+    async def _defer_operation(self, operation_id: str, exec_date: "Any", reason: str, schema: str | None):
+        """Reset task to pending for re-pickup at exec_date without counting as a retry.
+
+        Unlike `_schedule_retry`, this does not bump `retry_count` and does not
+        populate `error_message` — defer is intentional backpressure, not a failure.
+        """
+        table = fq_table("async_operations", schema)
+        await self._pool.execute(
+            f"""
+            UPDATE {table}
+            SET status = 'pending', next_retry_at = $2, worker_id = NULL, claimed_at = NULL,
+                updated_at = now()
+            WHERE operation_id = $1
+            """,
+            operation_id,
+            exec_date,
+        )
+        logger.info(f"Task {operation_id} deferred until {exec_date}: {reason}")
+
     async def execute_task(self, task: ClaimedTask):
         """Execute a single task as a background job (fire-and-forget)."""
         task_type = task.task_dict.get("type", "unknown")
@@ -532,6 +676,8 @@ class WorkerPoller:
                 task.task_dict["_schema"] = task.schema
             await self._executor(task.task_dict)
             logger.debug(f"Task {task.operation_id} execution finished")
+        except DeferOperation as e:
+            await self._defer_operation(task.operation_id, e.exec_date, e.reason, task.schema)
         except RetryTaskAt as e:
             await self._schedule_retry(task.operation_id, e.retry_at, str(e), task.schema)
         except Exception as e:
@@ -931,7 +1077,14 @@ class WorkerPoller:
             min_size = pool.get_min_size() if hasattr(pool, "get_min_size") else None
             max_size = pool.get_max_size() if hasattr(pool, "get_max_size") else None
             queue = getattr(pool, "_queue", None)
-            waiters = queue.qsize() if queue is not None and hasattr(queue, "qsize") else None
+            # asyncpg's _queue is a LifoQueue pre-filled to max_size with
+            # PoolConnectionHolder objects. qsize() therefore counts *available
+            # holders*, not callers waiting on the pool — the previous "waiters"
+            # label here was the opposite of what it suggested. The actual count
+            # of awaiters is len(_queue._getters), nonzero only when qsize()==0.
+            free_holders = queue.qsize() if queue is not None and hasattr(queue, "qsize") else None
+            getters = getattr(queue, "_getters", None) if queue is not None else None
+            pending_acquires = len(getters) if getters is not None else None
 
             parts = [f"size={size}"]
             if min_size is not None and max_size is not None:
@@ -939,8 +1092,10 @@ class WorkerPoller:
             if free is not None:
                 parts.append(f"idle={free}")
                 parts.append(f"in_use={size - free}")
-            if waiters is not None:
-                parts.append(f"waiters={waiters}")
+            if free_holders is not None:
+                parts.append(f"free_holders={free_holders}")
+            if pending_acquires is not None:
+                parts.append(f"pending_acquires={pending_acquires}")
             return " ".join(parts)
         except Exception as e:
             logger.debug(f"Pool stats unavailable: {e}")

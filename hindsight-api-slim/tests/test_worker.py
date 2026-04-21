@@ -137,6 +137,55 @@ class TestBrokerTaskBackend:
         payload = json.loads(row["task_payload"])
         assert payload["node_ids"] == ["node1", "node2"]
 
+    @pytest.mark.asyncio
+    async def test_submit_task_preserves_existing_payload(self, pool, clean_operations):
+        """Callers now INSERT task_payload atomically, then call submit_task as a
+        no-op for the BrokerTaskBackend path. submit_task must not overwrite a
+        payload that is already set, otherwise a stale updated_at bump on a
+        possibly-already-processing row reintroduces noise the fix aimed to remove.
+        """
+        operation_id = uuid.uuid4()
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+
+        original_payload = {"type": "test_task", "bank_id": bank_id, "version": "inserted"}
+        await pool.execute(
+            """
+            INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload)
+            VALUES ($1, $2, 'test_operation', 'pending', $3::jsonb)
+            """,
+            operation_id,
+            bank_id,
+            json.dumps(original_payload),
+        )
+
+        row_before = await pool.fetchrow(
+            "SELECT updated_at FROM async_operations WHERE operation_id = $1",
+            operation_id,
+        )
+
+        backend = BrokerTaskBackend(pool_getter=lambda: pool)
+        await backend.initialize()
+
+        await backend.submit_task(
+            {
+                "operation_id": str(operation_id),
+                "type": "test_task",
+                "bank_id": bank_id,
+                "version": "resubmitted",
+            }
+        )
+
+        row_after = await pool.fetchrow(
+            "SELECT task_payload, updated_at FROM async_operations WHERE operation_id = $1",
+            operation_id,
+        )
+        payload = json.loads(row_after["task_payload"])
+        assert payload["version"] == "inserted", "submit_task must not overwrite an existing payload"
+        assert row_after["updated_at"] == row_before["updated_at"], (
+            "submit_task must not bump updated_at when payload was already set"
+        )
+
 
 class TestWorkerPoller:
     """Tests for WorkerPoller task claiming and execution."""
@@ -465,6 +514,275 @@ class TestWorkerPoller:
             "The poller must not override status set by the executor."
         )
         assert "Simulated conversion error" in row["error_message"]
+
+    @pytest.mark.asyncio
+    async def test_executor_defer_requeues_without_bumping_retry_count(self, pool, clean_operations):
+        """DeferOperation requeues the task without counting as a retry.
+
+        Unlike RetryTaskAt (failure-driven), DeferOperation is intentional
+        backpressure: the row goes back to 'pending' with next_retry_at set,
+        but retry_count is unchanged and error_message stays NULL.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        from hindsight_api.worker import WorkerPoller
+        from hindsight_api.worker.exceptions import DeferOperation
+        from hindsight_api.worker.poller import ClaimedTask
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        op_id = uuid.uuid4()
+        payload = json.dumps({"type": "retain", "operation_id": str(op_id), "bank_id": bank_id})
+        await _ensure_bank(pool, bank_id)
+        await pool.execute(
+            """
+            INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload, worker_id, claimed_at, retry_count)
+            VALUES ($1, $2, 'retain', 'processing', $3::jsonb, 'test-worker-1', now(), 0)
+            """,
+            op_id,
+            bank_id,
+            payload,
+        )
+
+        defer_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+        async def deferring_executor(task_dict):
+            raise DeferOperation(exec_date=defer_until, reason="upstream quota window not yet open")
+
+        poller = WorkerPoller(
+            pool=pool,
+            worker_id="test-worker-1",
+            executor=deferring_executor,
+        )
+
+        task_dict = json.loads(payload)
+        claimed_task = ClaimedTask(operation_id=str(op_id), task_dict=task_dict, schema=None)
+        await poller.execute_task(claimed_task)
+
+        completed = await poller.wait_for_active_tasks(timeout=5.0)
+        assert completed, "Task did not complete within timeout"
+
+        row = await pool.fetchrow(
+            "SELECT status, worker_id, claimed_at, retry_count, error_message, next_retry_at "
+            "FROM async_operations WHERE operation_id = $1",
+            op_id,
+        )
+        assert row["status"] == "pending"
+        assert row["worker_id"] is None
+        assert row["claimed_at"] is None
+        assert row["retry_count"] == 0, "defer must NOT increment retry_count"
+        assert row["error_message"] is None, "defer must NOT write error_message"
+        assert row["next_retry_at"] is not None
+        # exec_date should round-trip; allow 1s slack for db precision
+        assert abs((row["next_retry_at"] - defer_until).total_seconds()) < 1
+
+    @pytest.mark.asyncio
+    async def test_deferred_task_not_picked_up_until_exec_date(self, pool, clean_operations):
+        """A deferred task is invisible to claim_batch until next_retry_at <= NOW()."""
+        from datetime import datetime, timedelta, timezone
+
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        op_id = uuid.uuid4()
+        payload = json.dumps({"type": "retain", "operation_id": str(op_id), "bank_id": bank_id})
+        await _ensure_bank(pool, bank_id)
+        future = datetime.now(timezone.utc) + timedelta(minutes=5)
+        await pool.execute(
+            """
+            INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload, next_retry_at)
+            VALUES ($1, $2, 'retain', 'pending', $3::jsonb, $4)
+            """,
+            op_id,
+            bank_id,
+            payload,
+            future,
+        )
+
+        poller = WorkerPoller(
+            pool=pool,
+            worker_id="test-worker-1",
+            executor=lambda x: None,
+        )
+
+        claimed = await poller.claim_batch()
+        assert all(c.operation_id != str(op_id) for c in claimed), "deferred task must not be claimed before exec_date"
+
+        # Move next_retry_at into the past — task becomes claimable.
+        await pool.execute(
+            "UPDATE async_operations SET next_retry_at = now() - interval '1 minute' WHERE operation_id = $1",
+            op_id,
+        )
+        claimed = await poller.claim_batch()
+        assert any(c.operation_id == str(op_id) for c in claimed), "task must be claimed once next_retry_at has passed"
+
+    @pytest.mark.asyncio
+    async def test_defer_operation_exported_from_extensions(self):
+        """DeferOperation must be importable from hindsight_api.extensions for extension authors."""
+        from hindsight_api.extensions import DeferOperation as DeferFromExtensions
+        from hindsight_api.worker.exceptions import DeferOperation as DeferFromWorker
+
+        assert DeferFromExtensions is DeferFromWorker
+
+    @pytest.mark.asyncio
+    async def test_extension_validate_retain_defer_propagates_to_poller(self, pool, clean_operations):
+        """An OperationValidatorExtension that raises DeferOperation in validate_retain
+        causes the worker to requeue the task at the requested exec_date.
+
+        Mimics the MemoryEngine flow: the executor calls validate_retain before doing
+        any real work, the exception bubbles up to the poller, which defers the row.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        from hindsight_api.extensions import (
+            DeferOperation,
+            OperationValidatorExtension,
+            RecallContext,
+            ReflectContext,
+            RetainContext,
+            ValidationResult,
+        )
+        from hindsight_api.worker import WorkerPoller
+        from hindsight_api.worker.poller import ClaimedTask
+
+        defer_until = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+        class DeferringValidator(OperationValidatorExtension):
+            def __init__(self):
+                super().__init__({})
+
+            async def validate_retain(self, ctx: RetainContext) -> ValidationResult:
+                raise DeferOperation(exec_date=defer_until, reason="quota window closed")
+
+            async def validate_recall(self, ctx: RecallContext) -> ValidationResult:
+                return ValidationResult.accept()
+
+            async def validate_reflect(self, ctx: ReflectContext) -> ValidationResult:
+                return ValidationResult.accept()
+
+        validator = DeferringValidator()
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        op_id = uuid.uuid4()
+        payload = json.dumps({"type": "retain", "operation_id": str(op_id), "bank_id": bank_id})
+        await _ensure_bank(pool, bank_id)
+        await pool.execute(
+            """
+            INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload, worker_id, claimed_at, retry_count)
+            VALUES ($1, $2, 'retain', 'processing', $3::jsonb, 'test-worker-1', now(), 0)
+            """,
+            op_id,
+            bank_id,
+            payload,
+        )
+
+        async def executor_calling_validator(task_dict):
+            ctx = RetainContext(
+                bank_id=task_dict["bank_id"],
+                contents=[],
+                request_context=None,  # type: ignore[arg-type]
+            )
+            await validator.validate_retain(ctx)
+
+        poller = WorkerPoller(
+            pool=pool,
+            worker_id="test-worker-1",
+            executor=executor_calling_validator,
+        )
+
+        task_dict = json.loads(payload)
+        claimed_task = ClaimedTask(operation_id=str(op_id), task_dict=task_dict, schema=None)
+        await poller.execute_task(claimed_task)
+
+        completed = await poller.wait_for_active_tasks(timeout=5.0)
+        assert completed, "Task did not complete within timeout"
+
+        row = await pool.fetchrow(
+            "SELECT status, worker_id, claimed_at, retry_count, error_message, next_retry_at "
+            "FROM async_operations WHERE operation_id = $1",
+            op_id,
+        )
+        assert row["status"] == "pending"
+        assert row["worker_id"] is None
+        assert row["claimed_at"] is None
+        assert row["retry_count"] == 0
+        assert row["error_message"] is None
+        assert abs((row["next_retry_at"] - defer_until).total_seconds()) < 1
+
+    @pytest.mark.asyncio
+    async def test_memory_engine_execute_task_passes_through_defer_operation(self, memory):
+        """Regression test: MemoryEngine.execute_task must pass DeferOperation
+        through to the worker poller unchanged (same as RetryTaskAt).
+
+        Prior to this fix, the generic ``except Exception`` in execute_task
+        converted any exception — including DeferOperation — into a
+        ``RetryTaskAt(60s)``, which bumps retry_count and writes an
+        error_message. That silently broke the "defer is not a failure"
+        semantics added in #1105: a task scheduled hours out (e.g. by a
+        backpressure-aware extension waiting for a quota window to open)
+        would instead come back in 60 seconds with retry_count bumped.
+
+        Verify by injecting a validator that raises DeferOperation during
+        validate_retain and confirming the outer exception type that
+        escapes execute_task is DeferOperation, not RetryTaskAt.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        from hindsight_api.extensions import (
+            DeferOperation,
+            OperationValidatorExtension,
+            RecallContext,
+            ReflectContext,
+            RetainContext,
+            ValidationResult,
+        )
+        from hindsight_api.worker.exceptions import DeferOperation as DeferOpFromExceptions
+        from hindsight_api.worker.exceptions import RetryTaskAt
+
+        defer_until = datetime.now(timezone.utc) + timedelta(hours=6)
+
+        class QuotaDeferringValidator(OperationValidatorExtension):
+            def __init__(self):
+                super().__init__({})
+
+            async def validate_retain(self, ctx: RetainContext) -> ValidationResult:
+                raise DeferOperation(exec_date=defer_until, reason="quota_window_closed")
+
+            async def validate_recall(self, ctx: RecallContext) -> ValidationResult:
+                return ValidationResult.accept()
+
+            async def validate_reflect(self, ctx: ReflectContext) -> ValidationResult:
+                return ValidationResult.accept()
+
+        # Attach the validator to the MemoryEngine so it's invoked from
+        # inside retain_batch_async → _validate_operation.
+        memory._operation_validator = QuotaDeferringValidator()
+
+        # Set up a bank the task handler can address.
+        bank_id = f"test-defer-passthrough-{uuid.uuid4().hex[:8]}"
+        async with memory._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO banks (bank_id) VALUES ($1) ON CONFLICT DO NOTHING",
+                bank_id,
+            )
+
+        task_dict = {
+            "type": "batch_retain",
+            "bank_id": bank_id,
+            "contents": [{"content": "x"}],
+            "operation_id": str(uuid.uuid4()),
+            "_tenant_id": "default",
+        }
+
+        # Contract: DeferOperation must escape execute_task intact.
+        # Must NOT be converted to RetryTaskAt. Must NOT be swallowed.
+        with pytest.raises(DeferOpFromExceptions) as exc_info:
+            await memory.execute_task(task_dict)
+
+        assert exc_info.value.reason == "quota_window_closed"
+        assert abs((exc_info.value.exec_date - defer_until).total_seconds()) < 1
+
+        # Defensive: confirm it wasn't a RetryTaskAt masquerading as Defer.
+        assert not isinstance(exc_info.value, RetryTaskAt)
 
     @pytest.mark.asyncio
     async def test_claim_batch_skips_consolidation_when_same_bank_processing(self, pool, clean_operations):
@@ -1836,3 +2154,497 @@ class TestMarkFailedParentPropagation:
             f"Parent batch_retain should be 'failed' after child fails via unhandled exception, "
             f"got '{parent_row['status']}'"
         )
+
+
+class TestClaimBatchRotation:
+    """Tests for round-robin schema rotation in claim_batch.
+
+    These use a mocked _claim_batch_for_schema so the tests are hermetic
+    and exercise rotation logic without needing multiple real tenant schemas.
+    """
+
+    def _make_poller_with_fake_work(self, pool, pending_per_schema, max_slots=1):
+        """Build a poller whose schemas and per-schema claims are scripted.
+
+        ``pending_per_schema`` maps schema name -> current pending count.
+        The fake claim handler decrements the count and returns a ClaimedTask
+        if the schema still has work, else returns an empty list.
+        """
+        from hindsight_api.extensions.tenant import Tenant, TenantExtension
+        from hindsight_api.worker import WorkerPoller
+        from hindsight_api.worker.poller import ClaimedTask
+
+        schemas = list(pending_per_schema.keys())
+
+        class StaticTenantExtension(TenantExtension):
+            def __init__(self):
+                super().__init__(config={})
+
+            async def authenticate(self, context):
+                raise NotImplementedError
+
+            async def list_tenants(self) -> list[Tenant]:
+                return [Tenant(schema=s) for s in schemas]
+
+        poller = WorkerPoller(
+            pool=pool,
+            worker_id="test-rotation",
+            executor=lambda x: None,
+            tenant_extension=StaticTenantExtension(),
+            max_slots=max_slots,
+            # No consolidation reservation — all slots available for non-consolidation
+            # test tasks. Keeps the fair-rotation behavior easy to assert.
+            consolidation_max_slots=0,
+        )
+
+        serviced: list[str] = []
+
+        async def fake_claim(schema, non_consolidation_limit, consolidation_limit):
+            # Tests only exercise non-consolidation ("test") tasks, so we only
+            # consult the non-consolidation limit.
+            remaining = pending_per_schema.get(schema, 0)
+            if remaining <= 0 or non_consolidation_limit <= 0:
+                return []
+            take = min(remaining, non_consolidation_limit)
+            pending_per_schema[schema] = remaining - take
+            out = []
+            for _ in range(take):
+                serviced.append(schema)
+                out.append(
+                    ClaimedTask(
+                        operation_id=str(uuid.uuid4()),
+                        task_dict={"operation_type": "test", "bank_id": schema or "default"},
+                        schema=schema,
+                    )
+                )
+            return out
+
+        poller._claim_batch_for_schema = fake_claim  # type: ignore[method-assign]
+
+        async def fake_scan(scan_schemas):
+            return {s for s in scan_schemas if pending_per_schema.get(s, 0) > 0}
+
+        poller._scan_active_schemas = fake_scan  # type: ignore[method-assign]
+        return poller, serviced
+
+    @pytest.mark.asyncio
+    async def test_rotation_advances_past_serviced_schema(self, pool):
+        """After claiming from schema at offset N, next poll starts at N+1.
+
+        This is the 'crucial detail' that separates working rotation from
+        broken rotation: advancing +1 from the previous offset would cause
+        the first schema with work to always win.
+        """
+        # Only schema "b" has work; "a" and "c" are idle.
+        pending = {"a": 0, "b": 5, "c": 0}
+        poller, serviced = self._make_poller_with_fake_work(pool, pending, max_slots=1)
+
+        await poller.claim_batch()
+        # Found work at index 1 ("b"), so next offset should be 2 ("c").
+        assert poller._next_schema_idx == 2
+        assert serviced == ["b"]
+
+    @pytest.mark.asyncio
+    async def test_rotation_advances_by_one_when_no_work(self, pool):
+        """Empty sweep advances offset by 1 so we don't keep re-hitting the same head."""
+        pending = {"a": 0, "b": 0, "c": 0}
+        poller, serviced = self._make_poller_with_fake_work(pool, pending, max_slots=1)
+
+        poller._next_schema_idx = 0
+        await poller.claim_batch()
+        assert poller._next_schema_idx == 1
+        assert serviced == []
+
+        await poller.claim_batch()
+        assert poller._next_schema_idx == 2
+        assert serviced == []
+
+    @pytest.mark.asyncio
+    async def test_small_tenant_not_starved_by_busy_tenant(self, pool):
+        """Small tenant with 1 pending task gets serviced within bounded polls
+        even when another tenant has a huge backlog. Prevents the regression
+        observed in prod where one tenant's 1000+ retains monopolized workers.
+        """
+        pending = {"friday-main": 1000, "tenant-b": 1}
+        poller, serviced = self._make_poller_with_fake_work(pool, pending, max_slots=1)
+
+        # MAX_SLOTS=1 means one claim per poll. Over ~2 polls the rotation
+        # must reach tenant-b, regardless of which started first.
+        for _ in range(5):
+            await poller.claim_batch()
+            if "tenant-b" in serviced:
+                break
+
+        assert "tenant-b" in serviced, f"tenant-b was starved; serviced={serviced[:20]}"
+
+    @pytest.mark.asyncio
+    async def test_max_slots_greater_than_one_spreads_across_tenants(self, pool):
+        """With MAX_SLOTS>1 the first pass caps at 1 claim per schema so
+        a single poll services multiple tenants rather than draining one.
+        """
+        pending = {"a": 10, "b": 10, "c": 10, "d": 10, "e": 10}
+        poller, serviced = self._make_poller_with_fake_work(pool, pending, max_slots=3)
+
+        await poller.claim_batch()
+        # First pass gives 1 claim each to 3 different schemas — not 3 from the same one.
+        assert len(serviced) == 3
+        assert len(set(serviced)) == 3, f"Expected 3 different tenants, got {serviced}"
+
+    @pytest.mark.asyncio
+    async def test_max_slots_greater_than_one_backfills_when_only_one_tenant_has_work(self, pool):
+        """Second pass fills remaining slots when only one tenant has work,
+        so fairness doesn't sacrifice throughput in the single-tenant case.
+        """
+        pending = {"a": 0, "b": 10, "c": 0}
+        poller, serviced = self._make_poller_with_fake_work(pool, pending, max_slots=3)
+
+        await poller.claim_batch()
+        # Pass 1: 1 from "b" (only one with work). Pass 2: 2 more from "b".
+        assert serviced == ["b", "b", "b"]
+
+    @pytest.mark.asyncio
+    async def test_scan_finds_schemas_with_pending_work(self, pool, clean_operations):
+        """_scan_active_schemas identifies schemas with pending rows
+        and ignores empty schemas. Uses real DB, no mocks.
+        """
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-scan-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+
+        poller = WorkerPoller(
+            pool=pool,
+            worker_id="test-scan",
+            executor=lambda x: None,
+        )
+
+        # No pending rows → scan returns empty
+        result = await poller._scan_active_schemas([None])
+        assert None not in result, "Scan found work in schema with no pending rows"
+
+        # Insert a pending row
+        op_id = uuid.uuid4()
+        await pool.execute(
+            """INSERT INTO async_operations
+               (operation_id, bank_id, operation_type, status, task_payload)
+               VALUES ($1, $2, 'test', 'pending', $3::jsonb)""",
+            op_id,
+            bank_id,
+            json.dumps({"type": "test", "bank_id": bank_id}),
+        )
+
+        try:
+            # Now scan should find work
+            result = await poller._scan_active_schemas([None])
+            assert None in result, "Scan missed schema with pending work"
+        finally:
+            await pool.execute("DELETE FROM async_operations WHERE operation_id = $1", op_id)
+
+    @pytest.mark.asyncio
+    async def test_claim_batch_only_queries_active_schemas(self, pool, clean_operations):
+        """claim_batch uses _scan_active_schemas to pre-filter, then
+        only calls _claim_batch_for_schema on schemas the scan found.
+        Verifies the scan→claim pipeline end-to-end with real DB rows.
+        """
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-pipeline-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+
+        await pool.execute(
+            """INSERT INTO async_operations
+               (operation_id, bank_id, operation_type, status, task_payload)
+               VALUES ($1, $2, 'test', 'pending', $3::jsonb)""",
+            uuid.uuid4(),
+            bank_id,
+            json.dumps({"type": "test", "bank_id": bank_id}),
+        )
+
+        schemas_claimed: list[str | None] = []
+        poller = WorkerPoller(
+            pool=pool,
+            worker_id="test-pipeline",
+            executor=lambda x: None,
+        )
+        original_claim = poller._claim_batch_for_schema
+
+        async def tracking_claim(schema, nc_limit, cons_limit):
+            schemas_claimed.append(schema)
+            return await original_claim(schema, nc_limit, cons_limit)
+
+        poller._claim_batch_for_schema = tracking_claim  # type: ignore[method-assign]
+
+        claimed = await poller.claim_batch()
+
+        assert len(claimed) == 1, f"Expected 1 claimed task, got {len(claimed)}"
+        assert len(schemas_claimed) <= 3, (
+            f"Claim called on {len(schemas_claimed)} schemas — should only visit schemas the scan identified as active"
+        )
+
+
+class TestDecommissionAllWorkers:
+    """Tests for decommission-workers (all workers) functionality."""
+
+    @pytest.mark.asyncio
+    async def test_decommission_all_releases_all_processing_tasks(self, pool, clean_operations):
+        """Test that decommissioning all workers releases tasks from every worker."""
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+
+        # Create tasks for multiple workers
+        for worker in ["worker-a", "worker-b", "worker-c"]:
+            for i in range(2):
+                op_id = uuid.uuid4()
+                payload = json.dumps({"type": "test_task", "index": i, "bank_id": bank_id})
+                await pool.execute(
+                    """
+                    INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload, worker_id, claimed_at)
+                    VALUES ($1, $2, 'test', 'processing', $3::jsonb, $4, now())
+                    """,
+                    op_id,
+                    bank_id,
+                    payload,
+                    worker,
+                )
+
+        # Decommission all
+        result = await pool.fetch(
+            """
+            UPDATE async_operations
+            SET status = 'pending', worker_id = NULL, claimed_at = NULL, updated_at = now()
+            WHERE status = 'processing' AND bank_id = $1
+            RETURNING operation_id, worker_id, operation_type
+            """,
+            bank_id,
+        )
+
+        assert len(result) == 6
+
+        # All should be pending now
+        rows = await pool.fetch(
+            "SELECT status, worker_id, claimed_at FROM async_operations WHERE bank_id = $1",
+            bank_id,
+        )
+        for row in rows:
+            assert row["status"] == "pending"
+            assert row["worker_id"] is None
+            assert row["claimed_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_decommission_all_does_not_affect_pending_or_completed(self, pool, clean_operations):
+        """Test that decommissioning all workers only touches 'processing' tasks."""
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+
+        # Create a pending task
+        pending_id = uuid.uuid4()
+        await pool.execute(
+            """
+            INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload)
+            VALUES ($1, $2, 'test', 'pending', '{"type":"test","bank_id":"x"}'::jsonb)
+            """,
+            pending_id,
+            bank_id,
+        )
+
+        # Create a completed task
+        completed_id = uuid.uuid4()
+        await pool.execute(
+            """
+            INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload, completed_at)
+            VALUES ($1, $2, 'test', 'completed', '{"type":"test","bank_id":"x"}'::jsonb, now())
+            """,
+            completed_id,
+            bank_id,
+        )
+
+        # Create a processing task
+        processing_id = uuid.uuid4()
+        await pool.execute(
+            """
+            INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload, worker_id, claimed_at)
+            VALUES ($1, $2, 'test', 'processing', '{"type":"test","bank_id":"x"}'::jsonb, 'dead-worker', now())
+            """,
+            processing_id,
+            bank_id,
+        )
+
+        # Decommission all
+        result = await pool.fetch(
+            """
+            UPDATE async_operations
+            SET status = 'pending', worker_id = NULL, claimed_at = NULL, updated_at = now()
+            WHERE status = 'processing' AND bank_id = $1
+            RETURNING operation_id
+            """,
+            bank_id,
+        )
+
+        assert len(result) == 1
+        assert result[0]["operation_id"] == processing_id
+
+        # Pending task unchanged
+        pending_row = await pool.fetchrow(
+            "SELECT status FROM async_operations WHERE operation_id = $1", pending_id
+        )
+        assert pending_row["status"] == "pending"
+
+        # Completed task unchanged
+        completed_row = await pool.fetchrow(
+            "SELECT status FROM async_operations WHERE operation_id = $1", completed_id
+        )
+        assert completed_row["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_decommission_all_returns_empty_when_no_processing(self, pool, clean_operations):
+        """Test decommissioning when there are no processing tasks."""
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+
+        # Only pending tasks
+        for i in range(3):
+            op_id = uuid.uuid4()
+            payload = json.dumps({"type": "test_task", "index": i, "bank_id": bank_id})
+            await pool.execute(
+                """
+                INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload)
+                VALUES ($1, $2, 'test', 'pending', $3::jsonb)
+                """,
+                op_id,
+                bank_id,
+                payload,
+            )
+
+        result = await pool.fetch(
+            """
+            UPDATE async_operations
+            SET status = 'pending', worker_id = NULL, claimed_at = NULL, updated_at = now()
+            WHERE status = 'processing' AND bank_id = $1
+            RETURNING operation_id
+            """,
+            bank_id,
+        )
+
+        assert len(result) == 0
+
+
+class TestWorkerStatus:
+    """Tests for worker-status functionality."""
+
+    @pytest.mark.asyncio
+    async def test_worker_status_shows_processing_tasks(self, pool, clean_operations):
+        """Test that worker status returns all processing tasks with their details."""
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+
+        # Create processing tasks for two workers
+        for worker, op_type in [("worker-x", "retain"), ("worker-x", "consolidation"), ("worker-y", "retain")]:
+            op_id = uuid.uuid4()
+            payload = json.dumps({"type": "test_task", "bank_id": bank_id})
+            await pool.execute(
+                """
+                INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload, worker_id, claimed_at)
+                VALUES ($1, $2, $3, 'processing', $4::jsonb, $5, now())
+                """,
+                op_id,
+                bank_id,
+                op_type,
+                payload,
+                worker,
+            )
+
+        rows = await pool.fetch(
+            """
+            SELECT worker_id, operation_id, operation_type, bank_id,
+                   claimed_at, updated_at,
+                   now() - claimed_at AS running_for,
+                   now() - updated_at AS last_update_ago
+            FROM async_operations
+            WHERE status = 'processing' AND bank_id = $1
+            ORDER BY worker_id, claimed_at
+            """,
+            bank_id,
+        )
+
+        assert len(rows) == 3
+
+        # Verify all expected columns are present
+        for row in rows:
+            assert row["worker_id"] in ("worker-x", "worker-y")
+            assert row["operation_type"] in ("retain", "consolidation")
+            assert row["bank_id"] == bank_id
+            assert row["claimed_at"] is not None
+            assert row["updated_at"] is not None
+            assert row["running_for"] is not None
+            assert row["last_update_ago"] is not None
+
+        # Verify grouping: worker-x has 2, worker-y has 1
+        worker_x_rows = [r for r in rows if r["worker_id"] == "worker-x"]
+        worker_y_rows = [r for r in rows if r["worker_id"] == "worker-y"]
+        assert len(worker_x_rows) == 2
+        assert len(worker_y_rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_worker_status_excludes_non_processing(self, pool, clean_operations):
+        """Test that worker status only shows processing tasks, not pending/completed/failed."""
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+
+        # Create tasks in various statuses
+        for status in ["pending", "processing", "completed", "failed"]:
+            op_id = uuid.uuid4()
+            payload = json.dumps({"type": "test_task", "bank_id": bank_id})
+            worker = "status-worker" if status == "processing" else None
+            claimed = "now()" if status == "processing" else "NULL"
+            await pool.execute(
+                f"""
+                INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload, worker_id, claimed_at)
+                VALUES ($1, $2, 'test', $3, $4::jsonb, $5, {claimed})
+                """,
+                op_id,
+                bank_id,
+                status,
+                payload,
+                worker,
+            )
+
+        rows = await pool.fetch(
+            """
+            SELECT worker_id, operation_type, bank_id
+            FROM async_operations
+            WHERE status = 'processing' AND bank_id = $1
+            """,
+            bank_id,
+        )
+
+        assert len(rows) == 1
+        assert rows[0]["worker_id"] == "status-worker"
+
+    @pytest.mark.asyncio
+    async def test_worker_status_empty_when_no_processing(self, pool, clean_operations):
+        """Test that worker status returns empty when no tasks are processing."""
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+
+        # Only pending tasks
+        op_id = uuid.uuid4()
+        payload = json.dumps({"type": "test_task", "bank_id": bank_id})
+        await pool.execute(
+            """
+            INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload)
+            VALUES ($1, $2, 'test', 'pending', $3::jsonb)
+            """,
+            op_id,
+            bank_id,
+            payload,
+        )
+
+        rows = await pool.fetch(
+            """
+            SELECT worker_id FROM async_operations
+            WHERE status = 'processing' AND bank_id = $1
+            """,
+            bank_id,
+        )
+
+        assert len(rows) == 0

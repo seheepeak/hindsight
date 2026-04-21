@@ -36,6 +36,13 @@ import {
 import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { MemoryDetailPanel } from "./memory-detail-panel";
 import { MemoryDetailModal } from "./memory-detail-modal";
 import { Graph2D, convertHindsightGraphData, GraphNode } from "./graph-2d";
@@ -64,6 +71,15 @@ export function DataView({ factType }: DataViewProps) {
 
   // Fetch limit state - how many memories to load from the API
   const [fetchLimit, setFetchLimit] = useState(1000);
+
+  // Which timestamp drives the constellation recency color
+  type RecencyBasis = "mentioned_at" | "occurred_start" | "occurred_end";
+  const RECENCY_BASIS_LABEL: Record<RecencyBasis, string> = {
+    mentioned_at: "mentioned",
+    occurred_start: "occurred (start)",
+    occurred_end: "occurred (end)",
+  };
+  const [recencyBasis, setRecencyBasis] = useState<RecencyBasis>("mentioned_at");
 
   // Consolidation status for mental models
   const [consolidationStatus, setConsolidationStatus] = useState<{
@@ -212,6 +228,70 @@ export function DataView({ factType }: DataViewProps) {
   // Memoized color functions to prevent graph re-initialization
   // Uses brand colors: primary blue (#0074d9), teal (#009296), amber for entity, purple for causal
   const nodeColorFn = useCallback((node: GraphNode) => node.color || "#0074d9", []);
+
+  // For observations, size nodes by their proof_count (number of source facts
+  // consolidated into this observation) so "stronger" observations stand out.
+  const observationSizeLookup = useMemo(() => {
+    if (factType !== "observation" || !data?.table_rows) return null;
+    const counts = new Map<string, number>();
+    let max = 1;
+    for (const row of data.table_rows as Array<{ id: string; proof_count?: number | null }>) {
+      const c = row.proof_count ?? 1;
+      counts.set(row.id, c);
+      if (c > max) max = c;
+    }
+    return { counts, max };
+  }, [factType, data]);
+
+  // Recency heat — map each memory's chosen timestamp to 0..1 (oldest → newest).
+  // Linear so the position on the gradient bar reflects the actual time fraction
+  // between the oldest and newest memory in view.
+  const recencyLookup = useMemo(() => {
+    if (!data?.table_rows?.length) return null;
+    type Row = {
+      id: string;
+      mentioned_at?: string | null;
+      occurred_start?: string | null;
+      occurred_end?: string | null;
+    };
+    const times = new Map<string, number>();
+    let minT = Infinity;
+    let maxT = -Infinity;
+    for (const row of data.table_rows as Row[]) {
+      const ts = row[recencyBasis];
+      if (!ts) continue;
+      const t = Date.parse(ts);
+      if (Number.isNaN(t)) continue;
+      times.set(row.id, t);
+      if (t < minT) minT = t;
+      if (t > maxT) maxT = t;
+    }
+    if (!Number.isFinite(minT) || !Number.isFinite(maxT) || maxT === minT) {
+      return null;
+    }
+    return { times, minT, maxT };
+  }, [data, recencyBasis]);
+
+  const recencyHeatFn = useCallback(
+    (node: GraphNode) => {
+      if (!recencyLookup) return 0.5;
+      const t = recencyLookup.times.get(node.id);
+      if (t === undefined) return 0;
+      return (t - recencyLookup.minT) / (recencyLookup.maxT - recencyLookup.minT);
+    },
+    [recencyLookup]
+  );
+
+  const observationNodeSizeFn = useCallback(
+    (node: GraphNode) => {
+      if (!observationSizeLookup) return 3;
+      const c = observationSizeLookup.counts.get(node.id) ?? 1;
+      // proof_count=1 matches the default memory dot size; grows with sqrt so
+      // heavily-supported observations stand out without dwarfing the canvas.
+      return 3 + Math.min(Math.sqrt(c - 1) * 2, 11);
+    },
+    [observationSizeLookup]
+  );
   const linkColorFn = useCallback((link: any) => {
     if (link.type === "temporal") return "#009296"; // Brand teal
     if (link.type === "entity") return "#f59e0b"; // Amber
@@ -719,6 +799,20 @@ export function DataView({ factType }: DataViewProps) {
                   onNodeClick={handleGraphNodeClick}
                   nodeColorFn={nodeColorFn}
                   linkColorFn={linkColorFn}
+                  nodeSizeFn={factType === "observation" ? observationNodeSizeFn : undefined}
+                  sizeLegendLabel={factType === "observation" ? "source facts" : undefined}
+                  nodeHeatFn={recencyLookup ? recencyHeatFn : undefined}
+                  heatLegendLabel={
+                    recencyLookup ? `recency · ${RECENCY_BASIS_LABEL[recencyBasis]}` : undefined
+                  }
+                  heatLegendEndpoints={
+                    recencyLookup
+                      ? [
+                          new Date(recencyLookup.minT).toISOString().slice(0, 10),
+                          new Date(recencyLookup.maxT).toISOString().slice(0, 10),
+                        ]
+                      : undefined
+                  }
                 />
               </div>
 
@@ -753,6 +847,22 @@ export function DataView({ factType }: DataViewProps) {
                         drag to pan, hover to explore entity connections. Click a memory to view
                         details.
                       </p>
+                      <div className="space-y-2 pt-2">
+                        <h4 className="text-xs font-medium text-muted-foreground">Color by</h4>
+                        <Select
+                          value={recencyBasis}
+                          onValueChange={(v) => setRecencyBasis(v as RecencyBasis)}
+                        >
+                          <SelectTrigger className="h-8 w-full text-xs">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="mentioned_at">Mentioned</SelectItem>
+                            <SelectItem value="occurred_start">Occurred (start)</SelectItem>
+                            <SelectItem value="occurred_end">Occurred (end)</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
                       <div className="space-y-2 pt-2">
                         <h4 className="text-xs font-medium text-muted-foreground">Link types</h4>
                         {Object.entries({

@@ -294,6 +294,44 @@ class EntityListResponse(BaseModel):
     offset: int
 
 
+class EntityGraphResponse(BaseModel):
+    """Response model for entity co-occurrence graph endpoint."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "nodes": [
+                    {"data": {"id": "uuid-1", "label": "Alice", "mentionCount": 12, "color": "#42a5f5"}},
+                    {"data": {"id": "uuid-2", "label": "Google", "mentionCount": 8, "color": "#42a5f5"}},
+                ],
+                "edges": [
+                    {
+                        "data": {
+                            "id": "uuid-1-uuid-2",
+                            "source": "uuid-1",
+                            "target": "uuid-2",
+                            "linkType": "cooccurrence",
+                            "weight": 5,
+                            "color": "#ffd700",
+                            "lineStyle": "solid",
+                            "lastCooccurred": "2024-02-01T14:00:00Z",
+                        }
+                    }
+                ],
+                "total_entities": 2,
+                "total_edges": 1,
+                "limit": 1000,
+            }
+        }
+    )
+
+    nodes: list[dict[str, Any]]
+    edges: list[dict[str, Any]]
+    total_entities: int
+    total_edges: int
+    limit: int
+
+
 class EntityDetailResponse(BaseModel):
     """Response model for entity detail endpoint."""
 
@@ -1416,6 +1454,7 @@ class BankStatsResponse(BaseModel):
                 "failed_operations": 0,
                 "last_consolidated_at": "2024-01-15T10:30:00Z",
                 "pending_consolidation": 0,
+                "failed_consolidation": 0,
                 "total_observations": 45,
             }
         }
@@ -1438,6 +1477,10 @@ class BankStatsResponse(BaseModel):
     # Consolidation stats
     last_consolidated_at: str | None = Field(default=None, description="When consolidation last ran (ISO format)")
     pending_consolidation: int = Field(default=0, description="Number of memories not yet processed into observations")
+    failed_consolidation: int = Field(
+        default=0,
+        description="Number of source memories (world/experience) whose consolidation permanently failed and can be retried via the consolidation recovery endpoint.",
+    )
     total_observations: int = Field(default=0, description="Total number of observations")
 
 
@@ -1518,6 +1561,16 @@ class UpdateDirectiveRequest(BaseModel):
 class MentalModelTrigger(BaseModel):
     """Trigger settings for a mental model."""
 
+    mode: Literal["full", "delta"] = Field(
+        default="full",
+        description=(
+            "Refresh mode. 'full' (default) regenerates the mental model content from scratch on each refresh. "
+            "'delta' performs surgical edits against the existing content: unchanged sections are preserved "
+            "byte-for-byte, stale content is removed, new content is added. If the mental model has no existing "
+            "content, or if the source_query has changed since the last refresh, delta mode falls back to a full "
+            "regeneration automatically."
+        ),
+    )
     refresh_after_consolidation: bool = Field(
         default=False,
         description="If true, refresh this mental model after observations consolidation (real-time mode)",
@@ -1600,6 +1653,14 @@ class MentalModelResponse(BaseModel):
     reflect_response: dict | None = Field(
         default=None,
         description="Full reflect API response payload including based_on facts and observations",
+    )
+    is_stale: bool | None = Field(
+        default=None,
+        description=(
+            "True when new memories matching this mental model's tag/fact_type scope have been "
+            "ingested since last_refreshed_at, or consolidation has pending items. Only populated "
+            "when detail=full."
+        ),
     )
 
 
@@ -1748,6 +1809,31 @@ class BankTemplateConfig(BaseModel):
     )
     llm_gemini_safety_settings: list | None = Field(
         default=None, description="Per-bank Gemini/VertexAI safety filter settings"
+    )
+    recall_budget_function: str | None = Field(
+        default=None, description="Recall budget mapping function: 'fixed' or 'adaptive'"
+    )
+    recall_budget_fixed_low: int | None = Field(
+        default=None, description="Fixed thinking_budget for budget=low (function='fixed')"
+    )
+    recall_budget_fixed_mid: int | None = Field(
+        default=None, description="Fixed thinking_budget for budget=mid (function='fixed')"
+    )
+    recall_budget_fixed_high: int | None = Field(
+        default=None, description="Fixed thinking_budget for budget=high (function='fixed')"
+    )
+    recall_budget_adaptive_low: float | None = Field(
+        default=None, description="Ratio of max_tokens for budget=low (function='adaptive')"
+    )
+    recall_budget_adaptive_mid: float | None = Field(
+        default=None, description="Ratio of max_tokens for budget=mid (function='adaptive')"
+    )
+    recall_budget_adaptive_high: float | None = Field(
+        default=None, description="Ratio of max_tokens for budget=high (function='adaptive')"
+    )
+    recall_budget_min: int | None = Field(default=None, description="Floor for the adaptive function (after clamping)")
+    recall_budget_max: int | None = Field(
+        default=None, description="Ceiling for the adaptive function (after clamping)"
     )
 
     def get_config_updates(self) -> dict[str, Any]:
@@ -2847,6 +2933,7 @@ def _register_routes(app: FastAPI):
         bank_id: str,
         type: str | None = None,
         q: str | None = None,
+        consolidation_state: str | None = None,
         limit: int = 100,
         offset: int = 0,
         request_context: RequestContext = Depends(get_request_context),
@@ -2861,6 +2948,8 @@ def _register_routes(app: FastAPI):
             bank_id: Memory Bank ID (from path)
             type: Filter by fact type (world, experience, opinion)
             q: Search query for full-text search (searches text and context)
+            consolidation_state: Filter by consolidation state for source memories
+                (world/experience). One of 'failed', 'pending', or 'done'.
             limit: Maximum number of results (default: 100)
             offset: Offset for pagination (default: 0)
         """
@@ -2869,11 +2958,14 @@ def _register_routes(app: FastAPI):
                 bank_id=bank_id,
                 fact_type=type,
                 search_query=q,
+                consolidation_state=consolidation_state,
                 limit=limit,
                 offset=offset,
                 request_context=request_context,
             )
             return data
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):
@@ -3331,6 +3423,7 @@ def _register_routes(app: FastAPI):
                 operations_by_status=ops,
                 last_consolidated_at=stats["last_consolidated_at"],
                 pending_consolidation=stats["pending_consolidation"],
+                failed_consolidation=stats.get("failed_consolidation", 0),
                 total_observations=stats["total_observations"],
             )
         except OperationValidationError as e:
@@ -3407,6 +3500,36 @@ def _register_routes(app: FastAPI):
 
             error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.error(f"Error in /v1/default/banks/{bank_id}/entities: {error_detail}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/entities/graph",
+        response_model=EntityGraphResponse,
+        summary="Get entity co-occurrence graph",
+        description="Return a graph of entities (nodes) and their co-occurrences (edges) for visualization.",
+        operation_id="get_entity_graph",
+        tags=["Entities"],
+    )
+    async def api_entity_graph(
+        bank_id: str,
+        limit: int = Query(default=1000, description="Maximum number of co-occurrence edges to return"),
+        min_count: int = Query(default=1, description="Minimum cooccurrence_count to include an edge"),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Return entity co-occurrence graph for a bank."""
+        try:
+            return await app.state.memory.get_entity_graph(
+                bank_id, limit=limit, min_count=min_count, request_context=request_context
+            )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
+            logger.error(f"Error in /v1/default/banks/{bank_id}/entities/graph: {error_detail}")
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get(

@@ -17,7 +17,12 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 import tiktoken
 
 from .models import DirectiveInfo, LLMCall, ReflectAgentResult, TokenUsageSummary, ToolCall
-from .prompts import FINAL_SYSTEM_PROMPT, _extract_directive_rules, build_final_prompt, build_system_prompt_for_tools
+from .prompts import (
+    _extract_directive_rules,
+    build_final_prompt,
+    build_final_system_prompt,
+    build_system_prompt_for_tools,
+)
 from .tools_schema import get_reflect_tools
 
 
@@ -186,7 +191,7 @@ async def _generate_structured_output(
         DynamicModel = create_model("StructuredResponse", **fields)
 
         # Include the full schema in the prompt for better LLM guidance
-        schema_str = json.dumps(response_schema, indent=2)
+        schema_str = json.dumps(response_schema, indent=2, ensure_ascii=False)
 
         # Build field descriptions for the prompt
         field_descriptions = []
@@ -446,7 +451,7 @@ async def run_reflect_agent(
             llm_start = time.time()
             response, usage = await llm_config.call(
                 messages=[
-                    {"role": "system", "content": FINAL_SYSTEM_PROMPT},
+                    {"role": "system", "content": build_final_system_prompt(bank_profile.get("mission"))},
                     {"role": "user", "content": prompt},
                 ],
                 scope="reflect",
@@ -503,7 +508,7 @@ async def run_reflect_agent(
             llm_start = time.time()
             response, usage = await llm_config.call(
                 messages=[
-                    {"role": "system", "content": FINAL_SYSTEM_PROMPT},
+                    {"role": "system", "content": build_final_system_prompt(bank_profile.get("mission"))},
                     {"role": "user", "content": prompt},
                 ],
                 scope="reflect",
@@ -606,7 +611,7 @@ async def run_reflect_agent(
             llm_start = time.time()
             response, usage = await llm_config.call(
                 messages=[
-                    {"role": "system", "content": FINAL_SYSTEM_PROMPT},
+                    {"role": "system", "content": build_final_system_prompt(bank_profile.get("mission"))},
                     {"role": "user", "content": prompt},
                 ],
                 scope="reflect",
@@ -652,6 +657,46 @@ async def run_reflect_agent(
             if result.content:
                 answer = _clean_answer_text(result.content.strip())
 
+                # The call_with_tools call above is intentionally uncapped so the
+                # LLM has headroom to emit tool-call JSON plus any intermediate
+                # reasoning. But when the LLM short-circuits and returns text
+                # directly, that text becomes the user-visible final answer and
+                # must respect max_tokens like the forced-final paths do. If it
+                # overshoots, run one extra capped call to rewrite it within
+                # the cap.
+                if max_tokens is not None and len(_TIKTOKEN_ENCODING.encode(answer)) > max_tokens:
+                    rewrite_start = time.time()
+                    rewritten, rewrite_usage = await llm_config.call(
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Rewrite the user's text so it fits within the requested token "
+                                    "budget. Preserve the key facts and structure; drop lower-priority "
+                                    "detail. Respond with the rewritten text only, no preamble."
+                                ),
+                            },
+                            {
+                                "role": "user",
+                                "content": f"Target budget: {max_tokens} tokens.\n\nText to rewrite:\n{answer}",
+                            },
+                        ],
+                        scope="reflect",
+                        max_completion_tokens=max_tokens,
+                        return_usage=True,
+                    )
+                    total_input_tokens += rewrite_usage.input_tokens
+                    total_output_tokens += rewrite_usage.output_tokens
+                    llm_trace.append(
+                        {
+                            "scope": "final_rewrite",
+                            "duration_ms": int((time.time() - rewrite_start) * 1000),
+                            "input_tokens": rewrite_usage.input_tokens,
+                            "output_tokens": rewrite_usage.output_tokens,
+                        }
+                    )
+                    answer = _clean_answer_text(rewritten.strip())
+
                 # Generate structured output if schema provided
                 structured_output = None
                 if response_schema and answer:
@@ -679,7 +724,7 @@ async def run_reflect_agent(
             llm_start = time.time()
             response, usage = await llm_config.call(
                 messages=[
-                    {"role": "system", "content": FINAL_SYSTEM_PROMPT},
+                    {"role": "system", "content": build_final_system_prompt(bank_profile.get("mission"))},
                     {"role": "user", "content": prompt},
                 ],
                 scope="reflect",
@@ -743,7 +788,8 @@ async def run_reflect_agent(
                         "content": json.dumps(
                             {
                                 "error": "You must search for information first. Use search_mental_models(), search_observations(), or recall() before providing your final answer."
-                            }
+                            },
+                            ensure_ascii=False,
                         ),
                     }
                 )
@@ -805,7 +851,8 @@ async def run_reflect_agent(
                         "content": json.dumps(
                             {
                                 "error": f"Tool '{_normalize_tool_name(tc.name)}' is not available. Use only the tools provided to you."
-                            }
+                            },
+                            ensure_ascii=False,
                         ),
                     }
                 )
@@ -876,7 +923,7 @@ async def run_reflect_agent(
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "name": tc.name,  # Required by Gemini
-                        "content": json.dumps(output, default=str),
+                        "content": json.dumps(output, default=str, ensure_ascii=False),
                     }
                 )
 
@@ -899,7 +946,7 @@ async def run_reflect_agent(
                 )
 
                 try:
-                    output_chars = len(json.dumps(output))
+                    output_chars = len(json.dumps(output, ensure_ascii=False))
                 except (TypeError, ValueError):
                     output_chars = len(str(output))
 
@@ -936,7 +983,7 @@ def _tool_call_to_dict(tc: "LLMToolCall") -> dict[str, Any]:
         "type": "function",
         "function": {
             "name": tc.name,
-            "arguments": json.dumps(tc.arguments),
+            "arguments": json.dumps(tc.arguments, ensure_ascii=False),
         },
     }
     if tc.thought_signature is not None:
@@ -1034,7 +1081,7 @@ async def _execute_tool_with_timing(
         # Set attributes
         span.set_attribute("hindsight.tool.name", normalized_name)
         span.set_attribute("hindsight.tool.id", tc.id)
-        span.set_attribute("hindsight.tool.arguments", json.dumps(tc.arguments))
+        span.set_attribute("hindsight.tool.arguments", json.dumps(tc.arguments, ensure_ascii=False))
 
         try:
             result = await _execute_tool(

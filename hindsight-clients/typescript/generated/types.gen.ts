@@ -386,6 +386,12 @@ export type BankStatsResponse = {
    */
   pending_consolidation?: number;
   /**
+   * Failed Consolidation
+   *
+   * Number of source memories (world/experience) whose consolidation permanently failed and can be retried via the consolidation recovery endpoint.
+   */
+  failed_consolidation?: number;
+  /**
    * Total Observations
    *
    * Total number of observations
@@ -538,6 +544,60 @@ export type BankTemplateConfig = {
    * Per-bank Gemini/VertexAI safety filter settings
    */
   llm_gemini_safety_settings?: Array<unknown> | null;
+  /**
+   * Recall Budget Function
+   *
+   * Recall budget mapping function: 'fixed' or 'adaptive'
+   */
+  recall_budget_function?: string | null;
+  /**
+   * Recall Budget Fixed Low
+   *
+   * Fixed thinking_budget for budget=low (function='fixed')
+   */
+  recall_budget_fixed_low?: number | null;
+  /**
+   * Recall Budget Fixed Mid
+   *
+   * Fixed thinking_budget for budget=mid (function='fixed')
+   */
+  recall_budget_fixed_mid?: number | null;
+  /**
+   * Recall Budget Fixed High
+   *
+   * Fixed thinking_budget for budget=high (function='fixed')
+   */
+  recall_budget_fixed_high?: number | null;
+  /**
+   * Recall Budget Adaptive Low
+   *
+   * Ratio of max_tokens for budget=low (function='adaptive')
+   */
+  recall_budget_adaptive_low?: number | null;
+  /**
+   * Recall Budget Adaptive Mid
+   *
+   * Ratio of max_tokens for budget=mid (function='adaptive')
+   */
+  recall_budget_adaptive_mid?: number | null;
+  /**
+   * Recall Budget Adaptive High
+   *
+   * Ratio of max_tokens for budget=high (function='adaptive')
+   */
+  recall_budget_adaptive_high?: number | null;
+  /**
+   * Recall Budget Min
+   *
+   * Floor for the adaptive function (after clamping)
+   */
+  recall_budget_min?: number | null;
+  /**
+   * Recall Budget Max
+   *
+   * Ceiling for the adaptive function (after clamping)
+   */
+  recall_budget_max?: number | null;
 };
 
 /**
@@ -1338,6 +1398,38 @@ export type EntityDetailResponse = {
 };
 
 /**
+ * EntityGraphResponse
+ *
+ * Response model for entity co-occurrence graph endpoint.
+ */
+export type EntityGraphResponse = {
+  /**
+   * Nodes
+   */
+  nodes: Array<{
+    [key: string]: unknown;
+  }>;
+  /**
+   * Edges
+   */
+  edges: Array<{
+    [key: string]: unknown;
+  }>;
+  /**
+   * Total Entities
+   */
+  total_entities: number;
+  /**
+   * Total Edges
+   */
+  total_edges: number;
+  /**
+   * Limit
+   */
+  limit: number;
+};
+
+/**
  * EntityIncludeOptions
  *
  * Options for including entity observations in recall results.
@@ -1862,6 +1954,12 @@ export type MentalModelResponse = {
   reflect_response?: {
     [key: string]: unknown;
   } | null;
+  /**
+   * Is Stale
+   *
+   * True when new memories matching this mental model's tag/fact_type scope have been ingested since last_refreshed_at, or consolidation has pending items. Only populated when detail=full.
+   */
+  is_stale?: boolean | null;
 };
 
 /**
@@ -1870,6 +1968,12 @@ export type MentalModelResponse = {
  * Trigger settings for a mental model.
  */
 export type MentalModelTriggerInput = {
+  /**
+   * Mode
+   *
+   * Refresh mode. 'full' (default) regenerates the mental model content from scratch on each refresh. 'delta' performs surgical edits against the existing content: unchanged sections are preserved byte-for-byte, stale content is removed, new content is added. If the mental model has no existing content, or if the source_query has changed since the last refresh, delta mode falls back to a full regeneration automatically.
+   */
+  mode?: "full" | "delta";
   /**
    * Refresh After Consolidation
    *
@@ -1934,6 +2038,12 @@ export type MentalModelTriggerInput = {
  * Trigger settings for a mental model.
  */
 export type MentalModelTriggerOutput = {
+  /**
+   * Mode
+   *
+   * Refresh mode. 'full' (default) regenerates the mental model content from scratch on each refresh. 'delta' performs surgical edits against the existing content: unchanged sections are preserved byte-for-byte, stale content is removed, new content is added. If the mental model has no existing content, or if the source_query has changed since the last refresh, delta mode falls back to a full regeneration automatically.
+   */
+  mode?: "full" | "delta";
   /**
    * Refresh After Consolidation
    *
@@ -3362,6 +3472,10 @@ export type ListMemoriesData = {
      */
     q?: string | null;
     /**
+     * Consolidation State
+     */
+    consolidation_state?: string | null;
+    /**
      * Limit
      */
     limit?: number;
@@ -3703,6 +3817,57 @@ export type ListEntitiesResponses = {
 
 export type ListEntitiesResponse =
   ListEntitiesResponses[keyof ListEntitiesResponses];
+
+export type GetEntityGraphData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: {
+    /**
+     * Limit
+     *
+     * Maximum number of co-occurrence edges to return
+     */
+    limit?: number;
+    /**
+     * Min Count
+     *
+     * Minimum cooccurrence_count to include an edge
+     */
+    min_count?: number;
+  };
+  url: "/v1/default/banks/{bank_id}/entities/graph";
+};
+
+export type GetEntityGraphErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type GetEntityGraphError =
+  GetEntityGraphErrors[keyof GetEntityGraphErrors];
+
+export type GetEntityGraphResponses = {
+  /**
+   * Successful Response
+   */
+  200: EntityGraphResponse;
+};
+
+export type GetEntityGraphResponse =
+  GetEntityGraphResponses[keyof GetEntityGraphResponses];
 
 export type GetEntityData = {
   body?: never;
