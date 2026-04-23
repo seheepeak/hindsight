@@ -8,6 +8,8 @@ The reflect agent uses a hierarchical retrieval strategy:
 3. recall - Raw facts (world/experience) as ground truth fallback
 """
 
+from typing import Any
+
 # Tool definitions in OpenAI format
 
 TOOL_SEARCH_MENTAL_MODELS = {
@@ -44,12 +46,7 @@ TOOL_SEARCH_OBSERVATIONS = {
     "type": "function",
     "function": {
         "name": "search_observations",
-        "description": (
-            "Search consolidated observations (auto-generated knowledge). These are automatically "
-            "synthesized from memories. Returns observations with freshness info (updated_at, is_stale). "
-            "If an observation is STALE, you should ALSO use recall() to verify with current facts. "
-            "IMPORTANT: If search_mental_models is available, you MUST call it FIRST before using this tool."
-        ),
+        "description": ("Search consolidated observations (auto-generated summaries derived from raw memory facts)."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -134,101 +131,82 @@ TOOL_EXPAND = {
     },
 }
 
-TOOL_DONE_ANSWER = {
-    "type": "function",
-    "function": {
-        "name": "done",
-        "description": "Signal completion with your final answer. Use this when you have gathered enough information to answer the question.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "answer": {
-                    "type": "string",
-                    "description": "Your response as well-formatted markdown. Use headers, lists, bold/italic, and code blocks for clarity. NEVER include memory IDs, UUIDs, or 'Memory references' in this text - put IDs only in memory_ids array. LANGUAGE: By default, write in the SAME language as the user's question. However, if a language directive in the system prompt specifies a different language, follow that directive instead.",
-                },
-                "memory_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Array of memory IDs that support your answer (put IDs here, NOT in answer text)",
-                },
-                "mental_model_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Array of mental model IDs that support your answer",
-                },
-                "observation_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Array of observation IDs that support your answer",
-                },
-            },
-            "required": ["answer"],
-        },
-    },
+# Maps each search-tool name to the (field_name, description) of the done()
+# id array that should be filled with that tool's result IDs. The done()
+# schema only exposes the array fields whose source tool is registered for
+# the call - filling an array whose source tool is not registered would be
+# silently dropped at the agent layer (see _process_done_tool).
+_DONE_ID_ARRAY_FIELD_FOR_TOOL = {
+    "search_mental_models": (
+        "mental_model_ids",
+        "Array of mental model IDs that support your answer",
+    ),
+    "search_observations": (
+        "observation_ids",
+        "Array of observation IDs that support your answer",
+    ),
+    "recall": (
+        "memory_ids",
+        "Array of memory IDs that support your answer (put IDs here, NOT in answer text)",
+    ),
 }
 
 
-def _build_done_tool_with_directives(directive_rules: list[str]) -> dict:
+def _build_done_tool(
+    enabled_search_tools: list[str] | None = None,
+) -> dict:
+    """Build the done() tool schema for the reflect agent.
+
+    The id-array fields are emitted only for search tools that are actually
+    registered for this call (avoids dead surface that the agent layer
+    silently drops).
     """
-    Build the done tool schema with directive compliance field.
+    arrays_word_for_answer = "the *_ids arrays" if enabled_search_tools else "no id array (none registered)"
 
-    When directives are present, adds a required field that forces the agent
-    to confirm compliance with each directive before submitting.
+    description = (
+        "Signal completion with your final answer. Use this when you have gathered enough information "
+        "to answer the question."
+    )
+    answer_description = (
+        "Your response as well-formatted markdown. Use headers, lists, bold/italic, and code blocks for "
+        f"clarity. NEVER include memory IDs, UUIDs, or 'Memory references' in this text - put IDs only in "
+        f"{arrays_word_for_answer}. LANGUAGE: By default, write in the SAME language as the user's "
+        "question. However, if a language directive in the system prompt specifies a different language, "
+        "follow that directive instead."
+    )
 
-    Args:
-        directive_rules: List of directive rule strings
-    """
-    # Build rules list for description
-    rules_list = "\n".join(f"  {i + 1}. {rule}" for i, rule in enumerate(directive_rules))
+    properties: dict[str, Any] = {
+        "answer": {"type": "string", "description": answer_description},
+    }
+    required: list[str] = ["answer"]
 
-    # Build the tool with directive compliance field
+    for tool in enabled_search_tools or []:
+        field = _DONE_ID_ARRAY_FIELD_FOR_TOOL.get(tool)
+        if field is None:
+            continue
+        field_name, field_desc = field
+        properties[field_name] = {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": field_desc,
+        }
+        required.append(field_name)
+
     return {
         "type": "function",
         "function": {
             "name": "done",
-            "description": (
-                "Signal completion with your final answer. IMPORTANT: You must confirm directive compliance before submitting. "
-                "Your answer will be REJECTED if it violates any directive."
-            ),
+            "description": description,
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "answer": {
-                        "type": "string",
-                        "description": (
-                            "Your response as well-formatted markdown. Use headers, lists, bold/italic, and code blocks for clarity. "
-                            "NEVER include memory IDs, UUIDs, or 'Memory references' in this text - put IDs only in memory_ids array. "
-                            f"MANDATORY: Your answer MUST comply with ALL directives:\n{rules_list}"
-                        ),
-                    },
-                    "memory_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Array of memory IDs that support your answer (put IDs here, NOT in answer text)",
-                    },
-                    "mental_model_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Array of mental model IDs that support your answer",
-                    },
-                    "observation_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Array of observation IDs that support your answer",
-                    },
-                    "directive_compliance": {
-                        "type": "string",
-                        "description": f"REQUIRED: Confirm your answer complies with ALL directives. List each directive and how your answer follows it:\n{rules_list}\n\nFormat: 'Directive 1: [how answer complies]. Directive 2: [how answer complies]...'",
-                    },
-                },
-                "required": ["answer", "directive_compliance"],
+                "properties": properties,
+                "required": required,
             },
         },
     }
 
 
 def get_reflect_tools(
-    directive_rules: list[str] | None = None,
     include_mental_models: bool = True,
     include_observations: bool = True,
     include_recall: bool = True,
@@ -242,8 +220,6 @@ def get_reflect_tools(
     3. recall - Raw facts as ground truth
 
     Args:
-        directive_rules: Optional list of directive rule strings. If provided,
-                        the done() tool will require directive compliance confirmation.
         include_mental_models: Whether to include the search_mental_models tool.
         include_observations: Whether to include the search_observations tool.
         include_recall: Whether to include the recall tool.
@@ -252,20 +228,18 @@ def get_reflect_tools(
         List of tool definitions in OpenAI format
     """
     tools = []
+    enabled_search_tools: list[str] = []
 
     if include_mental_models:
         tools.append(TOOL_SEARCH_MENTAL_MODELS)
+        enabled_search_tools.append("search_mental_models")
     if include_observations:
         tools.append(TOOL_SEARCH_OBSERVATIONS)
+        enabled_search_tools.append("search_observations")
     if include_recall:
         tools.append(TOOL_RECALL)
+        enabled_search_tools.append("recall")
 
     tools.append(TOOL_EXPAND)
-
-    # Use directive-aware done tool if directives are present
-    if directive_rules:
-        tools.append(_build_done_tool_with_directives(directive_rules))
-    else:
-        tools.append(TOOL_DONE_ANSWER)
-
+    tools.append(_build_done_tool(enabled_search_tools=enabled_search_tools))
     return tools

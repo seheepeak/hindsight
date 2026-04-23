@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from .models import DirectiveInfo, LLMCall, ReflectAgentResult, TokenUsageSummary, ToolCall
 from .prompts import (
-    _extract_directive_rules,
     build_final_prompt,
     build_final_system_prompt,
     build_system_prompt_for_tools,
@@ -355,12 +354,7 @@ async def run_reflect_agent(
     # Build directives_applied for the trace
     directives_applied = _build_directives_applied(directives)
 
-    # Extract directive rules for tool schema (if any)
-    directive_rules = _extract_directive_rules(directives) if directives else None
-
-    # Get tools for this agent (with directive compliance field if directives exist)
     tools = get_reflect_tools(
-        directive_rules=directive_rules,
         include_mental_models=has_mental_models,
         include_observations=include_observations,
         include_recall=include_recall,
@@ -375,11 +369,12 @@ async def run_reflect_agent(
         directives=directives,
         has_mental_models=has_mental_models,
         include_observations=include_observations,
+        include_recall=include_recall,
         budget=budget,
     )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": query},
+        {"role": "user", "content": f"## Query\n{query}"},
     ]
 
     # Tracking

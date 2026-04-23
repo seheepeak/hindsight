@@ -8,6 +8,7 @@ Uses the LLMConfig wrapper for all LLM calls.
 import asyncio
 import json
 import logging
+import os
 import re
 from datetime import datetime, timedelta
 from typing import Literal, cast
@@ -229,6 +230,50 @@ class FactExtractionResponse(BaseModel):
     """Response containing all extracted facts (causal relations are embedded in each fact)."""
 
     facts: list[ExtractedFact] = Field(description="List of extracted factual statements")
+
+
+# Variant of ExtractedFact that drops the when/where/who/why scaffold and keeps only `statement`.
+# Downstream only uses the merged fact text, and `where`/`when` were silently dropped in practice,
+# so we rely on the prompt description to have the LLM weave all context into one self-contained sentence.
+class ExtractedFactUnified(BaseModel):
+    """A single extracted fact."""
+
+    model_config = ConfigDict(
+        json_schema_mode="validation",
+        json_schema_extra={"required": ["statement", "fact_type"]},
+    )
+
+    statement: str = Field(
+        description="Core fact - concise but complete (1-2 sentences). Must be a self-contained sentence that explicitly names the subject and weaves in motivation, significance, or temporal context when relevant."
+    )
+
+    fact_kind: str = Field(default="conversation", description="'event' or 'conversation'")
+    occurred_start: str | None = Field(default=None, description="ISO timestamp for events")
+    occurred_end: str | None = Field(default=None, description="ISO timestamp for event end")
+    fact_type: Literal["world", "assistant"] = Field(
+        description="'world' = external facts, incl. a participant's own actions/views that do not involve the advisor agent. 'assistant' = the advisor agent's own actions, or a direct interaction between a participant and the advisor agent. See the system prompt's CLASSIFICATION section for the authoritative definition."
+    )
+    entities: list[Entity] | None = Field(
+        default=None,
+        description="Specific named real-world entities (people, organizations, listed instruments) the fact is about. Sectors, themes, and abstract concepts are NOT entities. See the system prompt's ENTITIES section.",
+    )
+    causal_relations: list[FactCausalRelation] | None = Field(
+        default=None, description="Links to previous facts (target_index < this fact's index)"
+    )
+
+    @field_validator("entities", mode="before")
+    @classmethod
+    def ensure_entities_list(cls, v):
+        """Ensure entities is always a list (convert None to empty list)."""
+        if v is None:
+            return []
+        return v
+
+
+class FactExtractionUnifiedResponse(BaseModel):
+    """Response containing all extracted facts (causal relations are embedded in each fact)."""
+
+    facts: list[ExtractedFactUnified] = Field(description="List of extracted factual statements")
 
 
 class ExtractedFactVerbose(BaseModel):
@@ -887,6 +932,20 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
     extraction_mode = config.retain_extraction_mode
     extract_causal_links = config.retain_extract_causal_links
 
+    # Fully-custom override: HINDSIGHT_API_RETAIN_FULLY_CUSTOM_PROMPT, when set, is used
+    # verbatim as the complete system prompt, paired with the unified ExtractedFact
+    # schema (only `what` + classification + entities + causal_relations — no
+    # when/where/who/why scaffold). All scaffolding (retain_mission injection,
+    # mode-specific guidelines, base template) is bypassed. The causal-
+    # relationships section is still auto-appended when extract_causal_links is
+    # enabled so callers don't have to duplicate that rule.
+    full_prompt = os.environ.get("HINDSIGHT_API_RETAIN_FULLY_CUSTOM_PROMPT")
+    if full_prompt:
+        prompt = full_prompt
+        if extract_causal_links:
+            prompt = prompt + CAUSAL_RELATIONSHIPS_SECTION
+        return prompt, FactExtractionUnifiedResponse
+
     # Build retain_mission section if set - injected before the mode-specific guidelines
     # Escape braces so user-supplied text survives str.format() on the prompt template.
     from hindsight_api.engine.prompt_utils import escape_for_prompt
@@ -1023,9 +1082,10 @@ def _build_user_message(
         metadata_lines = "\n".join(f"  {k}: {v}" for k, v in metadata.items())
         metadata_section = f"\nMetadata:\n{metadata_lines}"
 
+    # narrator_section = ""
+    # if agent_name:
+    #     narrator_section = f'\nNarrator: {agent_name} (AI agent — first-person statements like "I did X" are the agent\'s own actions; classify as "assistant")'
     narrator_section = ""
-    if agent_name:
-        narrator_section = f'\nNarrator: {agent_name} (AI agent — first-person statements like "I did X" are the agent\'s own actions; classify as "assistant")'
 
     return f"""Extract facts from the following text chunk.
 
@@ -1175,7 +1235,7 @@ async def _extract_facts_from_chunk(
                     return None
 
                 # NEW FORMAT: what, when, who, why (all required)
-                what = get_value("what")
+                what = get_value("statement") or get_value("what")
                 when = get_value("when")
                 who = get_value("who")
                 why = get_value("why")
@@ -1881,7 +1941,7 @@ async def extract_facts_from_contents_batch_api(
                     return value
                 return None
 
-            what = get_value("what")
+            what = get_value("statement") or get_value("what")
             if not what:
                 what = get_value("factual_core")
             if not what:
