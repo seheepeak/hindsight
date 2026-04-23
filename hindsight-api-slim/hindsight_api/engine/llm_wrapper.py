@@ -177,6 +177,7 @@ def create_llm_provider(
         AnthropicLLM,
         ClaudeCodeLLM,
         CodexLLM,
+        FallbackLLM,
         GeminiLLM,
         LiteLLMLLM,
         LlamaCppLLM,
@@ -295,6 +296,9 @@ def create_llm_provider(
             extra_body=extra_body,
         )
 
+    elif provider_lower == "fallback":
+        return FallbackLLM(provider=provider, reasoning_effort=reasoning_effort)
+
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
@@ -365,6 +369,7 @@ class LLMProvider:
             "bedrock",
             "volcano",
             "openrouter",
+            "fallback",
         ]
         if self.provider not in valid_providers:
             raise ValueError(f"Invalid LLM provider: {self.provider}. Must be one of: {', '.join(valid_providers)}")

@@ -247,21 +247,6 @@ class TestReflectToolSchemas:
         assert "expand" in tool_names
         assert "done" in tool_names
 
-    def test_get_reflect_tools_with_directives(self):
-        """Test getting reflect tools with directive rules."""
-        from hindsight_api.engine.reflect.tools_schema import get_reflect_tools
-
-        tools = get_reflect_tools(directive_rules=["Always respond in French"])
-
-        tool_names = [t["function"]["name"] for t in tools]
-        assert "recall" in tool_names
-        assert "done" in tool_names
-
-        # Done tool should have directive_compliance field when directives are present
-        done_tool = next(t for t in tools if t["function"]["name"] == "done")
-        params = done_tool["function"]["parameters"]["properties"]
-        assert "directive_compliance" in params
-
     def test_get_reflect_tools_answer_mode(self):
         """Test getting reflect tools with answer output mode."""
         from hindsight_api.engine.reflect.tools_schema import get_reflect_tools

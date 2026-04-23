@@ -4752,6 +4752,7 @@ class MemoryEngine(MemoryEngineInterface):
         fact_type: str | None = None,
         search_query: str | None = None,
         consolidation_state: str | None = None,
+        memory_ids: list[str] | None = None,  # PATCH(seheepeak): enable batch fetching
         limit: int = 100,
         offset: int = 0,
         request_context: "RequestContext",
@@ -4768,6 +4769,8 @@ class MemoryEngine(MemoryEngineInterface):
                 'pending' (not yet consolidated, no failure), or
                 'done' (successfully consolidated). Only applies to source memory
                 types (world/experience).
+            memory_ids: Optional batch fetch by IDs. When provided, limit/offset
+                are ignored (all matches returned).
             limit: Maximum number of results to return
             offset: Offset for pagination
             request_context: Request context for authentication.
@@ -4822,6 +4825,11 @@ class MemoryEngine(MemoryEngineInterface):
                         f"Invalid consolidation_state '{consolidation_state}': expected 'failed', 'pending', or 'done'."
                     )
 
+            if memory_ids:
+                param_count += 1
+                query_conditions.append(f"id = ANY(${param_count}::uuid[])")
+                query_params.append(memory_ids)
+
             where_clause = "WHERE " + " AND ".join(query_conditions) if query_conditions else ""
 
             # Get total count
@@ -4836,11 +4844,11 @@ class MemoryEngine(MemoryEngineInterface):
             # Get units with limit and offset
             param_count += 1
             limit_param = f"${param_count}"
-            query_params.append(limit)
+            query_params.append(len(memory_ids) if memory_ids else limit)
 
             param_count += 1
             offset_param = f"${param_count}"
-            query_params.append(offset)
+            query_params.append(0 if memory_ids else offset)
 
             units = await conn.fetch(
                 f"""

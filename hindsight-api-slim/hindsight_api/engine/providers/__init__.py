@@ -7,6 +7,7 @@ This package contains concrete implementations of the LLMInterface for various p
 from .anthropic_llm import AnthropicLLM
 from .claude_code_llm import ClaudeCodeLLM
 from .codex_llm import CodexLLM
+from .fallback_llm import FallbackLLM
 from .gemini_llm import GeminiLLM
 from .litellm_llm import LiteLLMLLM
 from .llamacpp_llm import LlamaCppLLM
@@ -18,6 +19,7 @@ __all__ = [
     "AnthropicLLM",
     "ClaudeCodeLLM",
     "CodexLLM",
+    "FallbackLLM",
     "GeminiLLM",
     "LlamaCppLLM",
     "LiteLLMLLM",
