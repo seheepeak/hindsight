@@ -412,6 +412,7 @@ if TYPE_CHECKING:
     from hindsight_api.models import RequestContext
 
     from .audit import AuditLogListResponse, AuditLogStatsResponse
+    from .memories.base import StoredMemory  # PATCH(seheepeak): return type of get_memories_by_ids
     from .transfer import BankImportResult, ImportResult
 
 
@@ -9455,6 +9456,63 @@ class MemoryEngine(MemoryEngineInterface):
                 fq_table=fq_table,
                 bank_id=bank_id,
                 unit_id=str(memory_uuid),
+            )
+
+    # PATCH(seheepeak): batch read-by-id, absent from upstream's public surface.
+    #
+    # An earlier revision of this patch instead threaded a `memory_ids` filter
+    # through `list_memory_units` -- engine interface, engine, store interface, PG
+    # store, and the SQL builder, five upstream signatures. It broke on the v0.9.1
+    # rebase when upstream relocated that query build, and a layer left un-rethreaded
+    # fails at call time, not at rebase time. This is additive instead: it wraps the
+    # store primitive upstream already maintains and already calls from consolidation,
+    # reflect's expand and half a dozen places in this file, so a rebase has nothing
+    # to conflict with.
+    #
+    # `list_memory_units` was also the wrong shape for the job -- it pays for a COUNT
+    # and an entity-name join to render the curation table.
+    async def get_memories_by_ids(
+        self,
+        bank_id: str,
+        memory_ids: list[str],
+        request_context: "RequestContext",
+    ) -> list["StoredMemory"]:
+        """
+        Fetch memories by ID in one query, unpaginated.
+
+        Ids that do not exist -- never written, or deleted by consolidation -- are
+        simply absent from the result, so a caller holding a list of ids can diff
+        what came back against what it asked for to learn which ones went away.
+        Result order is unspecified; key it by ``unit_id`` if order matters.
+
+        Args:
+            bank_id: Bank ID
+            memory_ids: Memory unit IDs to fetch. Non-UUID entries are ignored by
+                the store; an empty list short-circuits to no query.
+            request_context: Request context for authentication.
+
+        Returns:
+            The ``StoredMemory`` rows that exist, in unspecified order.
+        """
+        if not memory_ids:
+            return []
+        await self._authenticate_tenant(request_context)
+        if self._operation_validator:
+            from hindsight_api.extensions import BankReadContext, BankReadOperation
+
+            ctx = BankReadContext(
+                bank_id=bank_id, operation=BankReadOperation.GET_MEMORY_UNIT, request_context=request_context
+            )
+            await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        from .memories import get_memories
+
+        backend = await self._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            return await get_memories().get_memories(
+                conn=conn,
+                fq_table=fq_table,
+                bank_id=bank_id,
+                unit_ids=memory_ids,
             )
 
     async def list_documents(

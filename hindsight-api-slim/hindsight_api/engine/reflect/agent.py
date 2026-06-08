@@ -19,7 +19,6 @@ from .models import DirectiveInfo, LLMCall, ReflectAgentResult, StructuredOutput
 from .prompts import (
     _SPLIT_SYNTHESIS_WARN_CHUNKS,
     CLAIMS_SYSTEM_PROMPT,
-    _extract_directive_rules,
     build_chunk_claims_prompt,
     build_final_prompt,
     build_final_system_prompt,
@@ -491,15 +490,11 @@ async def _run_reflect_agent_inner(
     # Build directives_applied for the trace
     directives_applied = _build_directives_applied(directives)
 
-    # Extract directive rules for tool schema (if any)
-    directive_rules = _extract_directive_rules(directives) if directives else None
-
-    # Get tools for this agent (with directive compliance field if directives exist).
+    # Get tools for this agent.
     # The expand tool only reads back raw source text (chunks/documents), so it is
     # useless and excluded when document text storage is disabled (per bank).
     include_expand = store_document_text
     tools = get_reflect_tools(
-        directive_rules=directive_rules,
         include_mental_models=has_mental_models,
         include_observations=include_observations,
         include_recall=include_recall,
@@ -515,6 +510,8 @@ async def _run_reflect_agent_inner(
         directives=directives,
         has_mental_models=has_mental_models,
         include_observations=include_observations,
+        include_recall=include_recall,
+        include_expand=include_expand,
         budget=budget,
     )
     messages: list[dict[str, Any]] = [

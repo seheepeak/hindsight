@@ -2824,6 +2824,9 @@ async def _consolidate_batch_with_llm(
         supports_max_items=config.llm_supports_max_items,
     )
 
+    # PATCH(seheepeak): skip the max_length-constrained model — its maxItems breaks our strict-schema host.
+    response_model = _ConsolidationBatchResponse
+
     max_attempts = config.consolidation_max_attempts
     inner_max_retries = config.consolidation_llm_max_retries
     last_exc: Exception | None = None

@@ -269,13 +269,19 @@ async def tool_search_observations(
         **recall_kwargs,
     )
 
-    is_stale = pending_consolidation > 0
-    if pending_consolidation == 0:
-        freshness = "up_to_date"
-    elif pending_consolidation < 10:
-        freshness = "slightly_stale"
-    else:
-        freshness = "stale"
+    # PATCH(seheepeak): pinned to "fresh". `pending_consolidation` counts unconsolidated facts
+    # across the WHOLE bank, so this verdict says nothing about the observations returned.
+    # The keys keep their shape, so every "if stale" branch in the prompt just never fires.
+    #
+    # is_stale = pending_consolidation > 0
+    # if pending_consolidation == 0:
+    #     freshness = "up_to_date"
+    # elif pending_consolidation < 10:
+    #     freshness = "slightly_stale"
+    # else:
+    #     freshness = "stale"
+    is_stale = False
+    freshness = "up_to_date"
 
     return {
         "query": query,

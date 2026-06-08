@@ -8,6 +8,8 @@ The reflect agent uses a hierarchical retrieval strategy:
 3. recall - Raw facts (world/experience) as ground truth fallback
 """
 
+from typing import Any
+
 # Tool definitions in OpenAI format
 
 TOOL_SEARCH_MENTAL_MODELS = {
@@ -44,12 +46,14 @@ TOOL_SEARCH_OBSERVATIONS = {
     "type": "function",
     "function": {
         "name": "search_observations",
-        "description": (
-            "Search consolidated observations (auto-generated knowledge). These are automatically "
-            "synthesized from memories. Returns observations with freshness info (updated_at, is_stale). "
-            "If an observation is STALE, you should ALSO use recall() to verify with current facts. "
-            "IMPORTANT: If search_mental_models is available, you MUST call it FIRST before using this tool."
-        ),
+        # PATCH(seheepeak): upstream's text tells the model to call recall() and
+        # search_mental_models, but get_reflect_tools gates both. A caller that
+        # restricts fact_types to observations (the knowledge-page default) gets
+        # this description with neither tool registered, which is the #1724
+        # failure mode. The advice is dropped rather than re-gated here: the
+        # system prompt already says the same thing in its retrieval levels,
+        # and those are gated.
+        "description": ("Search consolidated observations (auto-generated summaries derived from raw memory facts)."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -134,101 +138,85 @@ TOOL_EXPAND = {
     },
 }
 
-TOOL_DONE_ANSWER = {
-    "type": "function",
-    "function": {
-        "name": "done",
-        "description": "Signal completion with your final answer. Use this when you have gathered enough information to answer the question.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "answer": {
-                    "type": "string",
-                    "description": "Your response as well-formatted markdown. Use headers, lists, bold/italic, and code blocks for clarity. NEVER include memory IDs, UUIDs, or 'Memory references' in this text - put IDs only in memory_ids array. LANGUAGE: By default, write in the SAME language as the user's question. However, if a language directive in the system prompt specifies a different language, follow that directive instead.",
-                },
-                "memory_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Array of memory IDs that support your answer (put IDs here, NOT in answer text)",
-                },
-                "mental_model_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Array of mental model IDs that support your answer",
-                },
-                "observation_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Array of observation IDs that support your answer",
-                },
-            },
-            "required": ["answer"],
-        },
-    },
-}
+# Search tools in priority order, paired with the done() id array each one feeds
+# and that array's description. Both the done() schema below and the prompt
+# bullet that names these arrays (``prompts._id_arrays_guidance``) read this
+# table, so they cannot disagree about which arrays a call exposes.
+#
+# _build_done_tool marks every exposed array required. "Empty array if none"
+# spells out the answer for a source that returned nothing, so the model
+# returns [] instead of reaching for an id to put there.
+SEARCH_TOOL_ID_ARRAYS: tuple[tuple[str, str, str], ...] = (
+    (
+        "search_mental_models",
+        "mental_model_ids",
+        "Array of mental model IDs that support your answer (empty array if none)",
+    ),
+    (
+        "search_observations",
+        "observation_ids",
+        "Array of observation IDs that support your answer (empty array if none)",
+    ),
+    (
+        "recall",
+        "memory_ids",
+        "Array of memory IDs that support your answer (put IDs here, NOT in answer text; empty array if none)",
+    ),
+)
 
 
-def _build_done_tool_with_directives(directive_rules: list[str]) -> dict:
+def _build_done_tool(enabled_search_tools: list[str]) -> dict:
+    """Build the done() tool schema for the tools registered on this call.
+
+    Only the id arrays whose source tool is registered are exposed. The agent
+    throws away ids from a tool it never ran (see ``_process_done_tool``), so an
+    always-on array is dead surface that the model still fills in. Each exposed
+    array is required, so every answer arrives with the ids backing it.
+
+    Directives are deliberately NOT injected here. ``build_directives_section``
+    already states them at the top of the system prompt, and it tells the model
+    not to narrate its compliance. A second copy in the tool schema asked for
+    exactly that narration.
     """
-    Build the done tool schema with directive compliance field.
+    arrays = [(field, desc) for name, field, desc in SEARCH_TOOL_ID_ARRAYS if name in enabled_search_tools]
+    if arrays:
+        id_target = "/".join(field for field, _ in arrays) + " array(s)"
+    else:
+        id_target = "no array (none is registered)"
 
-    When directives are present, adds a required field that forces the agent
-    to confirm compliance with each directive before submitting.
+    properties: dict[str, Any] = {
+        "answer": {
+            "type": "string",
+            "description": (
+                "Your response as well-formatted markdown. Use headers, lists, bold/italic, and code blocks "
+                "for clarity. NEVER include memory IDs, UUIDs, or 'Memory references' in this text - put IDs "
+                f"only in {id_target}. LANGUAGE: By default, write in the SAME language as the user's "
+                "question. However, if a language directive in the system prompt specifies a different "
+                "language, follow that directive instead."
+            ),
+        }
+    }
+    for field, desc in arrays:
+        properties[field] = {"type": "array", "items": {"type": "string"}, "description": desc}
 
-    Args:
-        directive_rules: List of directive rule strings
-    """
-    # Build rules list for description
-    rules_list = "\n".join(f"  {i + 1}. {rule}" for i, rule in enumerate(directive_rules))
-
-    # Build the tool with directive compliance field
     return {
         "type": "function",
         "function": {
             "name": "done",
             "description": (
-                "Signal completion with your final answer. IMPORTANT: You must confirm directive compliance before submitting. "
-                "Your answer will be REJECTED if it violates any directive."
+                "Signal completion with your final answer. Use this when you have gathered enough "
+                "information to answer the question."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "answer": {
-                        "type": "string",
-                        "description": (
-                            "Your response as well-formatted markdown. Use headers, lists, bold/italic, and code blocks for clarity. "
-                            "NEVER include memory IDs, UUIDs, or 'Memory references' in this text - put IDs only in memory_ids array. "
-                            f"MANDATORY: Your answer MUST comply with ALL directives:\n{rules_list}"
-                        ),
-                    },
-                    "memory_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Array of memory IDs that support your answer (put IDs here, NOT in answer text)",
-                    },
-                    "mental_model_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Array of mental model IDs that support your answer",
-                    },
-                    "observation_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Array of observation IDs that support your answer",
-                    },
-                    "directive_compliance": {
-                        "type": "string",
-                        "description": f"REQUIRED: Confirm your answer complies with ALL directives. List each directive and how your answer follows it:\n{rules_list}\n\nFormat: 'Directive 1: [how answer complies]. Directive 2: [how answer complies]...'",
-                    },
-                },
-                "required": ["answer", "directive_compliance"],
+                "properties": properties,
+                "required": ["answer", *(field for field, _ in arrays)],
             },
         },
     }
 
 
 def get_reflect_tools(
-    directive_rules: list[str] | None = None,
     include_mental_models: bool = True,
     include_observations: bool = True,
     include_recall: bool = True,
@@ -243,8 +231,6 @@ def get_reflect_tools(
     3. recall - Raw facts as ground truth
 
     Args:
-        directive_rules: Optional list of directive rule strings. If provided,
-                        the done() tool will require directive compliance confirmation.
         include_mental_models: Whether to include the search_mental_models tool.
         include_observations: Whether to include the search_observations tool.
         include_recall: Whether to include the recall tool.
@@ -256,21 +242,20 @@ def get_reflect_tools(
         List of tool definitions in OpenAI format
     """
     tools = []
+    enabled_search_tools: list[str] = []
 
     if include_mental_models:
         tools.append(TOOL_SEARCH_MENTAL_MODELS)
+        enabled_search_tools.append("search_mental_models")
     if include_observations:
         tools.append(TOOL_SEARCH_OBSERVATIONS)
+        enabled_search_tools.append("search_observations")
     if include_recall:
         tools.append(TOOL_RECALL)
+        enabled_search_tools.append("recall")
 
     if include_expand:
         tools.append(TOOL_EXPAND)
 
-    # Use directive-aware done tool if directives are present
-    if directive_rules:
-        tools.append(_build_done_tool_with_directives(directive_rules))
-    else:
-        tools.append(TOOL_DONE_ANSWER)
-
+    tools.append(_build_done_tool(enabled_search_tools))
     return tools
