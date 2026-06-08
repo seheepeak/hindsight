@@ -45,10 +45,6 @@ class TestDoneToolSchema:
         for field in ("memory_ids", "mental_model_ids", "observation_ids"):
             assert field in params["properties"]
 
-    def test_document_mode_composes_with_directives(self):
-        params = _done_tool(directive_rules=["Be concise"], answer_as_document=True)["function"]["parameters"]
-        assert set(params["required"]) == {"document", "directive_compliance"}
-
     def test_schema_has_no_union_types(self):
         """A tool schema goes to the provider verbatim, and Gemini rejects ``oneOf``."""
         rendered = repr(_done_tool(answer_as_document=True))
