@@ -9,8 +9,9 @@ The reflect agent uses a hierarchical retrieval strategy:
 """
 
 import copy
+from typing import Any
 
-from .prompts import NO_IDS_IN_TEXT_RULE
+from .prompts import NO_IDS_IN_TEXT_RULE, SEARCH_TOOL_ID_ARRAYS
 
 # Tool definitions in OpenAI format
 
@@ -50,12 +51,14 @@ TOOL_SEARCH_OBSERVATIONS = {
     "type": "function",
     "function": {
         "name": "search_observations",
-        "description": (
-            "Search consolidated observations (auto-generated knowledge). These are automatically "
-            "synthesized from memories. Returns observations with freshness info (updated_at, is_stale). "
-            "If an observation is STALE, you should ALSO use recall() to verify with current facts. "
-            "IMPORTANT: If search_mental_models is available, you MUST call it FIRST before using this tool."
-        ),
+        # PATCH(seheepeak): upstream's text tells the model to call recall() and
+        # search_mental_models, but get_reflect_tools gates both. A caller that
+        # restricts fact_types to observations (the knowledge-page default) gets
+        # this description with neither tool registered, which is the #1724
+        # failure mode. The advice is dropped rather than re-gated here: the
+        # system prompt already says the same thing in its retrieval levels,
+        # and those are gated.
+        "description": ("Search consolidated observations (auto-generated summaries derived from raw memory facts)."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -184,21 +187,45 @@ _DONE_ANSWER_DEFAULT_LANGUAGE = (
     "language directive in the system prompt specifies a different language, follow that directive instead."
 )
 
-#: Appended to both ``done`` descriptions. The stopping condition is what the
-#: model weighs at the moment it picks this tool over another search, and
-#: "gathered enough information" alone left *enough* undefined — so a page that
-#: merely shared the question's topic read as enough, and the reflect loop had
-#: already released the forced lower layers (see agent.py's short-circuit, and
-#: #4567). The retrieval-levels section of the system prompt carries the same
-#: rule once; this is the copy at the decision point. Measured on the reporter's
-#: banks, this wording alone did not make the model recall before a negative, so
-#: the absence half is also enforced in code through ``answer_found`` below.
-_DONE_SUFFICIENCY_GATE = (
-    " You have NOT gathered enough while the levels you searched do not STATE the answer: a result that only "
-    "shares the question's topic is not an answer, so search the next level (search_observations, then recall) "
-    "instead of answering around it. Never call done to report that nothing is known unless recall has already "
-    "run on the question's key terms."
-)
+
+# PATCH(seheepeak): upstream appends one constant here, _DONE_SUFFICIENCY_GATE,
+# that names search_observations and recall whatever get_reflect_tools
+# registered. An observation-only call (the knowledge-page default) was told
+# not to report "nothing is known" before a recall it has no tool for, which is
+# the #1724 failure mode. The same text is built from the registered tools.
+def _sufficiency_gate(enabled_search_tools: list[str], stop_tool: str) -> str:
+    """The stopping rule appended to the ``done`` and ``answer_ready`` descriptions.
+
+    The stopping condition is what the model weighs at the moment it picks this
+    tool over another search, and "gathered enough information" alone left
+    *enough* undefined — so a page that merely shared the question's topic read
+    as enough, and the reflect loop had already released the forced lower layers
+    (see agent.py's short-circuit, and #4567). The retrieval-levels section of the
+    system prompt carries the same rule once; this is the copy at the decision
+    point. Measured on the reporter's banks, this wording alone did not make the
+    model recall before a negative, so the absence half is also enforced in code
+    through ``answer_found`` below.
+
+    With every search tool registered this is upstream's text word for word. The
+    ladder names only the registered levels, and the recall sentence goes when
+    recall does, like the agent's own ``answer_found`` check (``if include_recall``).
+    """
+    gate = (
+        " You have NOT gathered enough while the levels you searched do not STATE the answer: a result that only "
+        "shares the question's topic is not an answer, "
+    )
+    if len(enabled_search_tools) > 1:
+        ladder = [name for name in ("search_observations", "recall") if name in enabled_search_tools]
+        gate += f"so search the next level ({', then '.join(ladder)}) instead of answering around it."
+    else:
+        gate += "so do not answer around it."
+    if "recall" in enabled_search_tools:
+        gate += (
+            f" Never call {stop_tool} to report that nothing is known unless recall has already run on the "
+            "question's key terms."
+        )
+    return gate
+
 
 #: The model's own verdict on whether it found the answer. Prose can't be
 #: checked, a bool can: when it is false and recall has not run yet, the agent
@@ -211,46 +238,55 @@ _DONE_ANSWER_FOUND_PROPERTY = {
     ),
 }
 
-TOOL_DONE_ANSWER = {
-    "type": "function",
-    "function": {
-        "name": "done",
-        "description": (
-            "Signal completion with your final answer. Use this when you have gathered enough information "
-            "to answer the question." + _DONE_SUFFICIENCY_GATE
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "answer": {
-                    "type": "string",
-                    "description": (
-                        "Your response as well-formatted markdown. Use headers, lists, bold/italic, and code blocks "
-                        "for clarity. NEVER include memory IDs, UUIDs, or 'Memory references' in this text - put IDs "
-                        f"only in memory_ids array.{_DONE_ANSWER_DEFAULT_LANGUAGE}"
-                    ),
-                },
-                "memory_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Array of memory IDs that support your answer (put IDs here, NOT in answer text)",
-                },
-                "mental_model_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Array of mental model IDs that support your answer",
-                },
-                "observation_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Array of observation IDs that support your answer",
-                },
-                "answer_found": _DONE_ANSWER_FOUND_PROPERTY,
+
+def _build_done_tool(enabled_search_tools: list[str]) -> dict:
+    """Build the done() tool schema for the tools registered on this call.
+
+    Only the id arrays whose source tool is registered are exposed. The agent
+    throws away ids from a tool it never ran (see ``_process_done_tool``), so an
+    always-on array is dead surface that the model still fills in. Each exposed
+    array is required, so every answer arrives with the ids backing it.
+
+    Directives are deliberately NOT injected here. ``build_directives_section``
+    already states them at the top of the system prompt, and it tells the model
+    not to narrate its compliance. A second copy in the tool schema asked for
+    exactly that narration.
+    """
+    arrays = [(field, desc) for name, field, desc in SEARCH_TOOL_ID_ARRAYS if name in enabled_search_tools]
+    if arrays:
+        id_target = "/".join(field for field, _ in arrays) + " array(s)"
+    else:
+        id_target = "no array (none is registered)"
+
+    properties: dict[str, Any] = {
+        "answer": {
+            "type": "string",
+            "description": (
+                "Your response as well-formatted markdown. Use headers, lists, bold/italic, and code blocks "
+                "for clarity. NEVER include memory IDs, UUIDs, or 'Memory references' in this text - put IDs "
+                f"only in {id_target}.{_DONE_ANSWER_DEFAULT_LANGUAGE}"
+            ),
+        }
+    }
+    for field, desc in arrays:
+        properties[field] = {"type": "array", "items": {"type": "string"}, "description": desc}
+    properties["answer_found"] = _DONE_ANSWER_FOUND_PROPERTY
+
+    return {
+        "type": "function",
+        "function": {
+            "name": "done",
+            "description": (
+                "Signal completion with your final answer. Use this when you have gathered enough "
+                "information to answer the question."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": ["answer", *(field for field, _ in arrays), "answer_found"],
             },
-            "required": ["answer", "answer_found"],
         },
-    },
-}
+    }
 
 
 # Document mode: the answer IS the stored document, so the model emits its
@@ -317,12 +353,9 @@ def _done_tool_for_document(base: dict) -> dict:
     params["required"] = ["document"] + [name for name in params.get("required", []) if name != "answer"]
     tool["function"]["description"] = (
         "Signal completion with your final answer, as a structured document. Use this when you have "
-        "gathered enough information to answer the question." + _DONE_SUFFICIENCY_GATE
+        "gathered enough information to answer the question."
     )
     return tool
-
-
-TOOL_DONE_DOCUMENT = _done_tool_for_document(TOOL_DONE_ANSWER)
 
 
 def _done_tool_for_output_language(base: dict, language: str) -> dict:
@@ -343,69 +376,6 @@ def _done_tool_for_output_language(base: dict, language: str) -> dict:
     return tool
 
 
-def _build_done_tool_with_directives(directive_rules: list[str]) -> dict:
-    """
-    Build the done tool schema with directive compliance field.
-
-    When directives are present, adds a required field that forces the agent
-    to confirm compliance with each directive before submitting.
-
-    Args:
-        directive_rules: List of directive rule strings
-    """
-    # Build rules list for description
-    rules_list = "\n".join(f"  {i + 1}. {rule}" for i, rule in enumerate(directive_rules))
-
-    # Build the tool with directive compliance field
-    return {
-        "type": "function",
-        "function": {
-            "name": "done",
-            "description": (
-                "Signal completion with your final answer. IMPORTANT: You must confirm directive compliance before submitting. "
-                "Your answer will be REJECTED if it violates any directive."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "answer": {
-                        "type": "string",
-                        "description": (
-                            "Your response as well-formatted markdown. Use headers, lists, bold/italic, and code blocks for clarity. "
-                            "NEVER include memory IDs, UUIDs, or 'Memory references' in this text - put IDs only in memory_ids array. "
-                            f"MANDATORY: Your answer MUST comply with ALL directives:\n{rules_list}"
-                        ),
-                    },
-                    "memory_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Array of memory IDs that support your answer (put IDs here, NOT in answer text)",
-                    },
-                    "mental_model_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Array of mental model IDs that support your answer",
-                    },
-                    "observation_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Array of observation IDs that support your answer",
-                    },
-                    "answer_found": _DONE_ANSWER_FOUND_PROPERTY,
-                    "directive_compliance": {
-                        "type": "string",
-                        "description": f"REQUIRED: Confirm your answer complies with ALL directives. List each directive and how your answer follows it:\n{rules_list}\n\nFormat: 'Directive 1: [how answer complies]. Directive 2: [how answer complies]...'",
-                    },
-                },
-                "required": ["answer", "answer_found", "directive_compliance"],
-            },
-        },
-    }
-
-
-#: ``_DONE_SUFFICIENCY_GATE`` for the tool that decides to stop when that is answer_ready.
-_READY_SUFFICIENCY_GATE = _DONE_SUFFICIENCY_GATE.replace("call done", "call answer_ready")
-
 #: The stop signal for reflects whose answer is written by the closing step: a turn that
 #: wrote the answer itself (as prose or as ``done``) was thrown away and written again
 #: there, so the model's last free turn cost as much as the answer (#5832).
@@ -416,7 +386,7 @@ TOOL_ANSWER_READY = {
         # The sufficiency gate moves here with the stop decision: done is only called once asked.
         "description": (
             "Call this when what you retrieved is enough to answer. You will then be asked for the answer "
-            "through done. Do not write the answer before you are asked for it." + _READY_SUFFICIENCY_GATE
+            "through done. Do not write the answer before you are asked for it."
         ),
         # The one argument is done's own verdict, so the "nothing is known needs recall first"
         # gate (#4567) still sees it: the answer itself is only written in the closing step.
@@ -430,7 +400,6 @@ TOOL_ANSWER_READY = {
 
 
 def get_reflect_tools(
-    directive_rules: list[str] | None = None,
     include_mental_models: bool = True,
     include_observations: bool = True,
     include_recall: bool = True,
@@ -448,8 +417,6 @@ def get_reflect_tools(
     3. recall - Raw facts as ground truth
 
     Args:
-        directive_rules: Optional list of directive rule strings. If provided,
-                        the done() tool will require directive compliance confirmation.
         include_mental_models: Whether to include the search_mental_models tool.
         include_observations: Whether to include the search_observations tool.
         include_recall: Whether to include the recall tool.
@@ -468,7 +435,8 @@ def get_reflect_tools(
     Returns:
         List of tool definitions in OpenAI format
     """
-    tools = []
+    # PATCH(seheepeak): typed so ty accepts the name/description lookups in the patch lines below.
+    tools: list[dict[str, Any]] = []
 
     if include_mental_models:
         tools.append(TOOL_SEARCH_MENTAL_MODELS)
@@ -478,17 +446,19 @@ def get_reflect_tools(
         tools.append(TOOL_SEARCH_OBSERVATIONS)
     if include_recall:
         tools.append(TOOL_RECALL)
+    # PATCH(seheepeak): the registered search tools, in priority order. The done() id
+    # arrays and the stopping rule (_sufficiency_gate) are both built from them.
+    registered = {t["function"]["name"] for t in tools}
+    enabled_search_tools = [name for name, _, _ in SEARCH_TOOL_ID_ARRAYS if name in registered]
 
     if include_expand:
         tools.append(TOOL_EXPAND)
     if answer_ready:
-        tools.append(TOOL_ANSWER_READY)
+        ready_tool: dict[str, Any] = copy.deepcopy(TOOL_ANSWER_READY)
+        ready_tool["function"]["description"] += _sufficiency_gate(enabled_search_tools, "answer_ready")
+        tools.append(ready_tool)
 
-    # Use directive-aware done tool if directives are present
-    if directive_rules:
-        done_tool = _build_done_tool_with_directives(directive_rules)
-    else:
-        done_tool = TOOL_DONE_ANSWER
+    done_tool = _build_done_tool(enabled_search_tools)
     if answer_as_document:
         done_tool = _done_tool_for_document(done_tool)
     if answer_ready:
@@ -498,8 +468,10 @@ def get_reflect_tools(
         done_tool["function"]["description"] = (
             f"Your final answer{', as a structured document' if answer_as_document else ''}. Call this only when "
             "you are asked for the answer; until then, call "
-            "answer_ready once you have enough." + _DONE_SUFFICIENCY_GATE
+            "answer_ready once you have enough."
         )
+    # PATCH(seheepeak): one append covers every variant: whichever description the swaps above left.
+    done_tool["function"]["description"] += _sufficiency_gate(enabled_search_tools, "done")
     # After the document and answer_ready swaps: those replace the description this appends to.
     if llm_output_language:
         done_tool = _done_tool_for_output_language(done_tool, llm_output_language)

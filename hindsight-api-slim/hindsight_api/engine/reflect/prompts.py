@@ -182,8 +182,12 @@ def bank_disposition_line(bank_profile: dict[str, Any]) -> str:
     # An all-neutral disposition is what a bank that never touched the traits reports, so
     # it keeps the exact prompt it had before this block existed — nothing is added and no
     # bank pays for a feature it did not configure.
+    # PATCH(seheepeak): an all-neutral line tells the model nothing it can act on, so it is
+    # dropped instead. The prompt preview and _bank_identity_section read this same helper,
+    # so all three stay in step. Upstream's return, kept visible for rebases:
+    #     return f"Disposition: {', '.join(traits)}"
     if all(disposition.get(trait, _NEUTRAL_TRAIT) == _NEUTRAL_TRAIT for trait in _TRAITS):
-        return f"Disposition: {', '.join(traits)}"
+        return ""
 
     # The numbers alone are not an instruction: a weaker model reads "skepticism=5" as
     # metadata and answers exactly as it would at skepticism=1 — which is what
@@ -200,12 +204,61 @@ def bank_disposition_line(bank_profile: dict[str, Any]) -> str:
     return f"Disposition: {', '.join(traits)}\n{described}"
 
 
+# Search tools in priority order, paired with the done() id array each one feeds
+# and that array's description. Both the done() schema
+# (``tools_schema._build_done_tool``) and the prompt bullet that names these
+# arrays (``_id_arrays_guidance`` below) read this table, so they cannot
+# disagree about which arrays a call exposes. It lives here and not in
+# tools_schema.py because tools_schema imports from this module, so importing
+# it back from there would be circular.
+#
+# _build_done_tool marks every exposed array required. The descriptions are
+# upstream's. reflect_async reads an empty array as "no filter" and keeps
+# everything retrieved, so they must not tell the model that [] means none.
+SEARCH_TOOL_ID_ARRAYS: tuple[tuple[str, str, str], ...] = (
+    (
+        "search_mental_models",
+        "mental_model_ids",
+        "Array of mental model IDs that support your answer",
+    ),
+    (
+        "search_observations",
+        "observation_ids",
+        "Array of observation IDs that support your answer",
+    ),
+    (
+        "recall",
+        "memory_ids",
+        "Array of memory IDs that support your answer (put IDs here, NOT in answer text)",
+    ),
+)
+
+
+def _id_arrays_guidance(search_tools: list[str]) -> str:
+    """The ``Put IDs ONLY in ...`` bullet, naming only the arrays done() exposes.
+
+    ``_build_done_tool`` emits an id array only for a registered search tool.
+    Upstream names all three arrays here whatever the gates say, which points the
+    model at fields that are missing from the schema it was handed. Both sides
+    filter SEARCH_TOOL_ID_ARRAYS by the registered search tools, so they cannot
+    drift apart.
+    """
+    arrays = [field for tool, field, _ in SEARCH_TOOL_ID_ARRAYS if tool in search_tools]
+    if not arrays:
+        return "- Do not include any IDs in the answer text"
+    if len(arrays) == 1:
+        return f"- Put IDs ONLY in the {arrays[0]} array, not in the answer"
+    return f"- Put IDs ONLY in the {'/'.join(arrays)} arrays, not in the answer"
+
+
 def build_system_prompt_for_tools(
     bank_profile: dict[str, Any],
     context: str | None = None,
     directives: list[dict[str, Any]] | None = None,
     has_mental_models: bool = False,
     include_observations: bool = True,
+    include_recall: bool = True,
+    include_expand: bool = True,
     budget: str | None = None,
     answer_as_document: bool = False,
     llm_output_language: str | None = None,
@@ -230,6 +283,10 @@ def build_system_prompt_for_tools(
         directives: Optional list of directive mental models to inject as hard rules
         has_mental_models: Whether the bank has any mental models (skip if not)
         include_observations: Whether search_observations is in the tool list.
+        include_recall: Whether recall is in the tool list. False when the caller
+            restricted fact_types to observations only.
+        include_expand: Whether expand is in the tool list. False when the bank
+            does not store document text, so there is no source text to read back.
         budget: Search depth budget - "low", "mid", or "high". Controls exploration thoroughness.
         answer_as_document: Whether done() takes a structured document instead of markdown.
         llm_output_language: Configured output language; drops the default language rule
@@ -328,9 +385,9 @@ def build_system_prompt_for_tools(
     )
 
     # Assemble the retrieval-level blocks for whatever tools are exposed.
-    # MM and Observations bodies are unconditional; recall's fallback wording
-    # adapts to which upstream tools precede it (telling the LLM to fall back
-    # to a tool that isn't in its list is the bug at the root of #1724).
+    # Each body names the levels below it, so the `is_stale` bullet and recall's
+    # fallback wording both adapt to which tools precede it. Telling the LLM to
+    # fall back to a tool that is not in its list is the bug behind #1724.
     levels: list[tuple[str, list[str]]] = []
     if has_mental_models:
         levels.append(
@@ -345,7 +402,9 @@ def build_system_prompt_for_tools(
                     "- A FRESH mental model may fully answer the question — but only if it actually STATES the "
                     "answer. One that shares the question's topic without stating the answer (e.g. it describes a "
                     "process, or names the thing without its status) has not answered it: go to the next level",
-                    "- Check `is_stale` field - if stale, also verify with lower levels",
+                    "- Check `is_stale` field - if stale, also verify with lower levels"
+                    if (include_observations or include_recall)
+                    else "- Check `is_stale` field to judge how much to trust it",
                 ],
             )
         )
@@ -355,7 +414,9 @@ def build_system_prompt_for_tools(
                 "OBSERVATIONS (search_observations)",
                 [
                     "- Auto-consolidated knowledge from memories",
-                    "- Check `is_stale` field - if stale, ALSO use recall() to verify",
+                    "- Check `is_stale` field - if stale, ALSO use recall() to verify"
+                    if include_recall
+                    else "- Check `is_stale` field to judge how much to trust it",
                     "- Good for understanding patterns and summaries",
                 ],
             )
@@ -370,9 +431,6 @@ def build_system_prompt_for_tools(
                 "nothing about something until recall() has run with the question's key terms (an issue key, name or "
                 "identifier) verbatim",
                 "- This is the source of truth that other levels are built from",
-                "",
-                "**Tool result ordering:** `recall()` and `search_observations()` return their `memories` / `observations` arrays sorted by SEMANTIC RELEVANCE to the query, NOT by time. The POSITION of an entry tells you nothing about when it was retained. For any temporal reasoning — recency, supersession, applying events on top of a state — IGNORE the position and read the per-entry `mentioned_at` field (and `occurred_start` / `occurred_end` for events).",
-                "",
             ]
         )
     elif has_mental_models:
@@ -393,9 +451,6 @@ def build_system_prompt_for_tools(
                 "not STATE the answer, you MUST call recall() before giving up. Never report that the bank holds "
                 "nothing about something until recall() has run with the question's key terms verbatim",
                 "- This is the source of truth that observations are built from",
-                "",
-                "**Tool result ordering:** `recall()` and `search_observations()` return their `memories` / `observations` arrays sorted by SEMANTIC RELEVANCE to the query, NOT by time. The POSITION of an entry tells you nothing about when it was retained. For any temporal reasoning — recency, supersession, applying events on top of a state — IGNORE the position and read the per-entry `mentioned_at` field (and `occurred_start` / `occurred_end` for events).",
-                "",
             ]
         )
     else:
@@ -405,7 +460,8 @@ def build_system_prompt_for_tools(
                 "- This is the source of truth.",
             ]
         )
-    levels.append(("RAW FACTS (recall) - Ground Truth", recall_body))
+    if include_recall:
+        levels.append(("RAW FACTS (recall) - Ground Truth", recall_body))
 
     # Position-dependent suffix for upstream tools; recall already carries its
     # fixed "- Ground Truth" suffix in the header text.
@@ -415,7 +471,11 @@ def build_system_prompt_for_tools(
     if len(levels) == 3:
         suffixes[1] = " - Second Priority"
 
-    if len(levels) == 1:
+    if not levels:
+        parts.append(
+            "No search tools are available. Answer from the context already provided, or call done() if you cannot."
+        )
+    elif len(levels) == 1:
         parts.append("You have access to ONE level of knowledge:")
     else:
         word = "TWO" if len(levels) == 2 else "THREE"
@@ -424,6 +484,23 @@ def build_system_prompt_for_tools(
     for idx, ((header, body), suffix) in enumerate(zip(levels, suffixes), 1):
         parts.append(f"### {idx}. {header}{suffix}")
         parts.extend(body)
+        parts.append("")
+
+    # Result arrays come back sorted by relevance, not time. This note sits
+    # outside the levels above, because the recall level it would fit into is
+    # gone whenever include_recall is False. It names only the registered tools.
+    time_bearing = [
+        t for t, on in (("recall()", include_recall), ("search_observations()", include_observations)) if on
+    ]
+    if time_bearing:
+        verb = "return" if len(time_bearing) > 1 else "returns"
+        parts.append(
+            f"**Tool result ordering:** {' and '.join(time_bearing)} {verb} result arrays sorted by "
+            "SEMANTIC RELEVANCE to the query, NOT by time. The POSITION of an entry tells you nothing about "
+            "when it was retained. For any temporal reasoning (recency, supersession, applying events on top "
+            "of a state) IGNORE the position and read the per-entry `mentioned_at` field (and "
+            "`occurred_start` / `occurred_end` for events)."
+        )
         parts.append("")
 
     # Stating the ladder here, rather than only forcing it turn by turn: the agent
@@ -452,18 +529,42 @@ def build_system_prompt_for_tools(
             ]
         )
 
+    # The registered search tools, highest level first: the order tools_schema registers them in.
+    search_tools = [
+        name
+        for name, on in (
+            ("search_mental_models", has_mental_models),
+            ("search_observations", include_observations),
+            ("recall", include_recall),
+        )
+        if on
+    ]
+    # The Query Strategy examples use the lowest registered level. That is recall whenever it is
+    # registered (the advice is really about it, PATCHES.md patch 2), and never a tool the model
+    # cannot call.
+    _example_tool = f"{search_tools[-1]}()" if search_tools else "The search tools"
+    _example_call = _example_tool.removesuffix("()")
     parts.extend(
         [
             "## Query Strategy",
-            "recall() uses semantic search. NEVER just echo the user's question - decompose it into targeted searches:",
+            # PATCH(seheepeak): upstream teaches the opposite here, splitting the
+            # question into short keyword searches. But recall feeds the same
+            # query string to both the embedding arm and the BM25 arm (see
+            # memories/pg/recall.py, retrieve_semantic_bm25_combined_sql). A
+            # natural-language phrase therefore feeds both arms, while a bare
+            # keyword leaves the embedding arm with nothing directional to match.
+            f"{_example_tool} uses hybrid semantic + keyword search. NEVER just echo the "
+            "user's question - rephrase it into a targeted query.",
             "",
-            "BAD: User asks 'recurring lesson themes between students' → recall('recurring lesson themes between students')",
-            "GOOD: Break it down into component searches:",
-            "  1. recall('lessons') - find all lesson-related memories",
-            "  2. recall('teaching sessions') - alternative phrasing",
-            "  3. recall('student progress') - find student-related memories",
+            "Each query should be a natural-language phrase that keeps the entities AND the "
+            "relation between them. Bare keywords drop the relation and only feed the keyword "
+            "half of the search.",
             "",
-            "Think: What ENTITIES and CONCEPTS does this question involve? Search for each separately.",
+            f"BAD (bare keywords):    {_example_call}('lessons'), {_example_call}('students')",
+            f"GOOD (entity+relation): {_example_call}('recurring lesson themes across students')",
+            "",
+            "Start with the single query that best captures the intent. If it underdelivers, "
+            "follow up with queries that vary the framing.",
             "",
         ]
     )
@@ -518,7 +619,7 @@ def build_system_prompt_for_tools(
                     "- Search across all available knowledge levels",
                     "- Use multiple query variations to ensure coverage",
                     "- Verify information across different retrieval levels",
-                    "- Use expand() to get full context on important memories",
+                    *(["- Use expand() to get full context on important memories"] if include_expand else []),
                     "- Take time to synthesize a complete, well-researched answer",
                     "",
                 ]
@@ -538,7 +639,7 @@ def build_system_prompt_for_tools(
         else:
             steps.append("First, try search_observations() - check for consolidated knowledge")
     # Recall step phrasing varies with whichever upstream tool(s) precede it.
-    if include_observations:
+    if include_recall and include_observations:
         steps.append(
             "If the levels above are stale, do not state the answer, OR you need specific details, "
             "use recall() for raw facts. Reporting that nothing is known requires recall() first"
@@ -546,14 +647,15 @@ def build_system_prompt_for_tools(
             else "If search_observations returns 0 results, is stale, OR does not state the answer, you MUST call "
             "recall() for raw facts"
         )
-    elif has_mental_models:
+    elif include_recall and has_mental_models:
         steps.append(
             "If there is no mental model, it's stale, OR it does not state the answer, use recall() for raw facts. "
             "Reporting that nothing is known requires recall() first"
         )
-    else:
+    elif include_recall:
         steps.append("Call recall() to gather raw facts")
-    steps.append("Use expand() if you need more context on specific memories")
+    if include_expand:
+        steps.append("Use expand() if you need more context on specific memories")
     steps.append(
         "When ready, call answer_ready(); you are then asked for the answer through done()"
         if answer_ready
@@ -609,7 +711,7 @@ def build_system_prompt_for_tools(
                 "- CRITICAL: Add blank lines before and after block elements (tables, code blocks, lists)",
                 "- Format for clarity and readability with proper spacing and hierarchy",
                 "- NEVER include memory IDs, UUIDs, or 'Memory references' in the answer text",
-                "- Put IDs ONLY in the memory_ids/mental_model_ids/observation_ids arrays, not in the answer",
+                _id_arrays_guidance(search_tools),
                 non_conversational_rule,
             ]
         )
@@ -867,17 +969,9 @@ def _bank_identity_section(bank_profile: dict, additional_context: str | None) -
     if mission:
         parts.append(f"Mission: {mission}")
 
-    disposition = bank_profile.get("disposition", {})
-    if disposition:
-        traits = []
-        if "skepticism" in disposition:
-            traits.append(f"skepticism={disposition['skepticism']}")
-        if "literalism" in disposition:
-            traits.append(f"literalism={disposition['literalism']}")
-        if "empathy" in disposition:
-            traits.append(f"empathy={disposition['empathy']}")
-        if traits:
-            parts.append(f"Disposition: {', '.join(traits)}")
+    disposition_line = bank_disposition_line(bank_profile)
+    if disposition_line:
+        parts.append(disposition_line)
 
     if additional_context:
         parts.append(f"\n## Additional Context\n{additional_context}")

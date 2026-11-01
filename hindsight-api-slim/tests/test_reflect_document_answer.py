@@ -51,13 +51,9 @@ class TestDoneToolSchema:
         for field in ("memory_ids", "mental_model_ids", "observation_ids"):
             assert field in params["properties"]
 
-    def test_document_mode_composes_with_directives(self):
-        params = _done_tool(directive_rules=["Be concise"], answer_as_document=True)["function"]["parameters"]
-        assert set(params["required"]) == {"document", "answer_found", "directive_compliance"}
-
     def test_every_variant_requires_answer_found(self):
         """The absence gate in the agent loop reads it (#4567), so no variant may drop it."""
-        for kwargs in ({}, {"directive_rules": ["Be concise"]}, {"answer_as_document": True}):
+        for kwargs in ({}, {"answer_as_document": True}):
             params = _done_tool(**kwargs)["function"]["parameters"]
             assert params["properties"]["answer_found"]["type"] == "boolean"
             assert "answer_found" in params["required"]

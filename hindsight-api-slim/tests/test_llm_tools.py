@@ -253,38 +253,18 @@ class TestReflectToolSchemas:
         assert "expand" in tool_names
         assert "done" in tool_names
 
-    def test_get_reflect_tools_with_directives(self):
-        """Test getting reflect tools with directive rules."""
-        from hindsight_api.engine.reflect.tools_schema import get_reflect_tools
-
-        tools = get_reflect_tools(directive_rules=["Always respond in French"])
-
-        tool_names = [t["function"]["name"] for t in tools]
-        assert "recall" in tool_names
-        assert "done" in tool_names
-
-        # Done tool should have directive_compliance field when directives are present
-        done_tool = next(t for t in tools if t["function"]["name"] == "done")
-        params = done_tool["function"]["parameters"]["properties"]
-        assert "directive_compliance" in params
-
-    @pytest.mark.parametrize("directive_rules", [None, ["Always respond in French"]])
     @pytest.mark.parametrize("answer_as_document", [False, True])
-    def test_get_reflect_tools_output_language_replaces_done_language_rule(self, directive_rules, answer_as_document):
+    def test_get_reflect_tools_output_language_replaces_done_language_rule(self, answer_as_document):
         """Every done() variant swaps its default source-language rule for the configured
         language — the schema is read right as the answer is written, so a rule left there
         out-ranks every directive that came before it (#3776)."""
-        from hindsight_api.engine.reflect.tools_schema import TOOL_DONE_ANSWER, get_reflect_tools
+        from hindsight_api.engine.reflect.tools_schema import get_reflect_tools
 
-        tools = get_reflect_tools(
-            directive_rules=directive_rules, answer_as_document=answer_as_document, llm_output_language="Spanish"
-        )
+        tools = get_reflect_tools(answer_as_document=answer_as_document, llm_output_language="Spanish")
         done_tool = next(t for t in tools if t["function"]["name"] == "done")
 
         assert "exclusively in Spanish" in done_tool["function"]["description"]
         assert "SAME language" not in json.dumps(done_tool)
-        # The module-level constant is never mutated.
-        assert "SAME language" in TOOL_DONE_ANSWER["function"]["parameters"]["properties"]["answer"]["description"]
 
     def test_get_reflect_tools_unset_output_language_keeps_done_language_rule(self):
         from hindsight_api.engine.reflect.tools_schema import get_reflect_tools
